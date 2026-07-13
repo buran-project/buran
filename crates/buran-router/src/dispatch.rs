@@ -119,6 +119,17 @@ struct Metrics {
     in_flight: AtomicU32,
 }
 
+/// Occupancy snapshot exposed by /status.
+pub struct PoolStats {
+    /// Worker processes currently running.
+    pub workers: u32,
+    /// Free request slots (capacity minus claimed); idle workers for
+    /// blocking pools.
+    pub idle: u64,
+    /// Requests accepted but not yet claimed by any worker.
+    pub queued: usize,
+}
+
 pub struct Pool {
     /// Router end of the shared work socket (connected datagram pair).
     work: UnixDatagram,
@@ -231,10 +242,22 @@ impl Pool {
         self.queue_timeout + self.request_timeout + Duration::from_secs(5)
     }
 
-    /// (workers, in_flight, queued≈waiting permits) — for /status.
-    pub fn stats(&self) -> (u32, u32, usize) {
-        let in_flight = self.metrics.in_flight.load(Ordering::Relaxed);
-        (self.metrics.active.load(Ordering::Relaxed), in_flight, self.pending.lock().map(|p| p.len()).unwrap_or(0))
+    /// Snapshot of pool occupancy for /status.
+    pub fn stats(&self) -> PoolStats {
+        let workers = self.metrics.active.load(Ordering::Relaxed);
+        // One pass over pending: an entry is claimed once a worker picked it
+        // up (`claimed_by`), otherwise it is still waiting in the kernel queue.
+        let claimed = {
+            let pending = self.pending.lock().expect("pending lock");
+            pending.values().filter(|p| p.claimed_by.is_some()).count()
+        };
+        let in_flight = self.metrics.in_flight.load(Ordering::Relaxed) as usize;
+        let queued = in_flight.saturating_sub(claimed);
+        // Free request slots: total capacity minus what workers hold now. For
+        // blocking pools (concurrency 1) this is exactly the idle worker count.
+        let capacity = u64::from(workers) * self.worker_concurrency();
+        let idle = capacity.saturating_sub(claimed as u64);
+        PoolStats { workers, idle, queued }
     }
 
     /// Concurrency of one worker for capacity math: before the first

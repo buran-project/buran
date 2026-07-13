@@ -293,12 +293,13 @@ pub async fn serve_connection(
                 } else {
                     let mut apps = String::new();
                     for (i, (name, pool)) in state.pools.iter().enumerate() {
-                        let (active, idle, queued) = pool.stats();
+                        let s = pool.stats();
                         if i > 0 {
                             apps.push(',');
                         }
                         apps.push_str(&format!(
-                            "\"{name}\":{{\"workers\":{active},\"idle\":{idle},\"queued\":{queued}}}"
+                            "\"{name}\":{{\"workers\":{},\"idle\":{},\"queued\":{}}}",
+                            s.workers, s.idle, s.queued
                         ));
                     }
                     format!("{{\"status\":\"ok\",\"applications\":{{{apps}}}}}\n")

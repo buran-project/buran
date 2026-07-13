@@ -135,8 +135,9 @@ Metrics response shape:
 ```
 
 - `workers` — active worker processes in the pool.
-- `idle` — workers currently idle.
-- `queued` — requests parked waiting for a free worker.
+- `idle` — free request slots (total capacity minus what workers hold right
+  now); for blocking runtimes this equals the idle worker count.
+- `queued` — requests accepted but not yet claimed by any worker.
 
 Use `/health` for container liveness/readiness probes and the root path for
 scraping pool saturation.
