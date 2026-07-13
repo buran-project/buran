@@ -91,9 +91,10 @@ Notes:
   frame stream rather than a file.
 - **`static.mime_types`** extends, never replaces, the built-in MIME table
   (see [Static files](static-files.md)).
-- **WebSocket** connections live outside the regular HTTP budgets:
-  `limits.timeout` and `http.idle_timeout` do **not** apply to an upgraded
-  tunnel; only `websocket.idle_timeout` does.
+- **WebSocket** connections live outside the regular HTTP budgets: the request
+  limits (`limits.response_timeout` / `limits.task_timeout`) and
+  `http.idle_timeout` do **not** apply to an upgraded tunnel; only
+  `websocket.idle_timeout` does.
 
 ## `listeners`
 

@@ -5,7 +5,7 @@
 //! command. The supervisor talks to the prototype over a control channel:
 //! one byte per spawn, the worker fd attached via SCM_RIGHTS.
 
-use std::io::IoSlice;
+use std::io::{IoSlice, Write};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixDatagram, UnixStream as StdUnixStream};
 use std::os::unix::process::CommandExt;
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use buran_config::Application;
-use buran_router::Spawner;
+use buran_router::{Spawn, Spawner};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use tracing::{info, warn};
 
@@ -242,6 +242,24 @@ impl PrototypeSpawner {
     }
 }
 
+impl Spawn for PrototypeSpawner {
+    fn spawn(&self) -> anyhow::Result<tokio::net::UnixStream> {
+        self.spawn_worker()
+    }
+
+    fn kill(&self, token: u64) {
+        // Best-effort: if the prototype is down there is nothing to kill (its
+        // workers died with it). The command reaches the worker's parent, which
+        // SIGKILLs by the pid it forked — pid-reuse safe.
+        let guard = self.prototype.lock().expect("prototype lock");
+        if let Some(proto) = guard.as_ref() {
+            if let Err(e) = send_kill(&proto.control, token) {
+                warn!(app = %self.app_name, "kill worker token {token}: {e}");
+            }
+        }
+    }
+}
+
 /// Route application output into the error log, line by line, tagged with
 /// the application name. One blocking thread per pipe, alive as long as
 /// the prototype (workers inherit the same pipe via fork).
@@ -258,15 +276,27 @@ fn forward_output(app: String, channel: &'static str, pipe: impl std::io::Read +
     });
 }
 
-/// One spawn command: a single byte with the worker fd attached.
+// Control protocol command bytes (must match the prototype).
+const CMD_SPAWN: u8 = 1;
+const CMD_KILL: u8 = 2;
+
+/// One spawn command: the CMD_SPAWN byte with the worker fd attached.
 fn send_fd(control: &StdUnixStream, fd: i32) -> std::io::Result<()> {
-    let data = [1u8];
+    let data = [CMD_SPAWN];
     let iov = [IoSlice::new(&data)];
     let fds = [fd];
     let cmsg = [ControlMessage::ScmRights(&fds)];
     sendmsg::<()>(control.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
         .map_err(std::io::Error::from)?;
     Ok(())
+}
+
+/// One kill command: the CMD_KILL byte followed by the 8-byte worker token.
+fn send_kill(control: &StdUnixStream, token: u64) -> std::io::Result<()> {
+    let mut msg = [0u8; 9];
+    msg[0] = CMD_KILL;
+    msg[1..9].copy_from_slice(&token.to_le_bytes());
+    (&mut &*control).write_all(&msg)
 }
 
 /// Returns the spawner plus the router end of the shared work socket
@@ -289,7 +319,7 @@ pub fn make_spawner(
         working_dir: app.working_directory.as_ref().map(PathBuf::from),
         work_worker_end: OwnedFd::from(worker_end),
     });
-    Ok((Arc::new(move || spawner.spawn_worker()), router_end))
+    Ok((spawner, router_end))
 }
 
 fn libc_dup2(old: i32, new: i32) -> i32 {

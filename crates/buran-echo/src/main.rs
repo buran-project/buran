@@ -82,7 +82,7 @@ fn main() -> ExitCode {
             // contract and owned exclusively by this process.
             let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
             let work = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(work_fd) };
-            match worker::serve(work, stream, &app) {
+            match worker::serve(work, stream, &app, 0) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("buran-echo: {e}");

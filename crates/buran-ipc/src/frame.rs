@@ -7,43 +7,76 @@ pub const FRAME_HEADER_LEN: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameKind {
+    // --- Handshake ---
     /// Worker -> router, first frame: magic + version (u32).
     Hello = 1,
     /// Router -> worker: accepted version (u32).
     HelloAck = 2,
+
+    // --- Request delivery (router -> worker) ---
     /// Router -> worker: flat request (see `request.rs`).
     Request = 3,
-    /// Worker -> router: status (aux) + serialized header block.
-    ResponseHeaders = 4,
-    /// Worker -> router: response body chunk.
-    ResponseBody = 5,
-    /// Worker -> router: request finished (supports early finish while the
-    /// script keeps running — the `fastcgi_finish_request` analogue).
-    End = 6,
-    /// Worker -> router: request failed; router replies 502/503 to client.
-    Error = 7,
-    /// Worker -> router: line for the error log.
-    Log = 8,
-    /// Worker -> router: ready for the next request (pool accounting).
-    /// Obsolete under the kernel-arbitrated work queue; tolerated on read.
-    Ready = 9,
-    /// Worker -> router: "request <id> is mine" — sent right after picking
-    /// a request off the shared work socket (diagnostics, stuck tracking).
-    Claim = 10,
-    /// Router -> workers via the shared work socket: exactly one idle
-    /// worker consumes it, finishes claimed requests and exits (dynamic
-    /// pool shrink; graceful by contract).
-    Retire = 11,
     /// Router -> worker on the private stream, after Claim of a request
     /// flagged FLAG_BODY_STREAM: one body chunk. A zero-length payload
     /// terminates the body; the worker judges completeness by comparing
     /// received bytes with content_length (short = client aborted).
-    RequestBody = 12,
+    RequestBody = 4,
+    /// Router -> workers via the shared work socket: exactly one idle
+    /// worker consumes it, finishes claimed requests and exits (dynamic
+    /// pool shrink; graceful by contract).
+    Retire = 5,
+
+    // --- Response (worker -> router) ---
+    /// Worker -> router: "request <id> is mine" — sent right after picking
+    /// a request off the shared work socket (diagnostics, stuck tracking).
+    Claim = 6,
+    /// Worker -> router: status (aux) + serialized header block.
+    ResponseHeaders = 7,
+    /// Worker -> router: response body chunk.
+    ResponseBody = 8,
+    /// Worker -> router: forward everything buffered for this request now and
+    /// keep the response open (PHP `flush()` / SSE). Signals the router to
+    /// commit to chunked streaming instead of buffering for content-length.
+    Flush = 9,
+    /// Worker -> router: the client response is complete (release the client,
+    /// stop `response_timeout`). The task may still be running in the
+    /// background (`fastcgi_finish_request`); `Done` marks its true end.
+    End = 10,
+    /// Worker -> router: task `request_id` is fully finished, including any
+    /// post-`fastcgi_finish_request` background work. Frees the worker's slot
+    /// and stops the task's wall-clock (`task_timeout`). A finish_request task
+    /// sends `End` early (release the client) then `Done` when the background
+    /// finishes. `Done` subsumes `End`: it also releases the client if no `End`
+    /// arrived (aborted task / misbehaving module), so the router never hangs.
+    Done = 11,
+    /// Worker -> router: request failed; router replies 502/503 to client.
+    /// Terminal — also frees the slot (no separate `Done`).
+    Error = 12,
+
+    // --- Liveness & cancellation ---
+    /// Router -> worker: liveness probe, sent only on suspicion (a task past
+    /// its budget whose slot did not free). `request_id` names the suspect
+    /// task (0 = pure liveness). A live worker answers with `Pong`.
+    Ping = 13,
+    /// Worker -> router: reply to `Ping`. `request_id` echoes the probe;
+    /// `aux` carries the worker status (`PONG_IDLE` / `PONG_BUSY`). No reply
+    /// within the deadline means the worker/event-loop is wedged.
+    Pong = 14,
+    /// Router -> worker on the private stream: the client for this request is
+    /// gone. The worker surfaces it as a short write to the runtime (PHP
+    /// user-abort), honoring the app's abort policy (`ignore_user_abort`).
+    Abort = 15,
+
+    // --- Diagnostics ---
+    /// Worker -> router: line for the error log.
+    Log = 16,
+
+    // --- Bidirectional (after upgrade) ---
     /// Both directions, after a request flagged FLAG_UPGRADE was answered
     /// with 101: one complete WebSocket message, opcode in `aux`
     /// (WS_OP_TEXT / WS_OP_BINARY / WS_OP_CLOSE). The router owns RFC 6455:
     /// masking, fragmentation and ping/pong never reach the worker.
-    WsMessage = 13,
+    WsMessage = 17,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -54,16 +87,20 @@ impl TryFrom<u8> for FrameKind {
             1 => Self::Hello,
             2 => Self::HelloAck,
             3 => Self::Request,
-            4 => Self::ResponseHeaders,
-            5 => Self::ResponseBody,
-            6 => Self::End,
-            7 => Self::Error,
-            8 => Self::Log,
-            9 => Self::Ready,
-            10 => Self::Claim,
-            11 => Self::Retire,
-            12 => Self::RequestBody,
-            13 => Self::WsMessage,
+            4 => Self::RequestBody,
+            5 => Self::Retire,
+            6 => Self::Claim,
+            7 => Self::ResponseHeaders,
+            8 => Self::ResponseBody,
+            9 => Self::Flush,
+            10 => Self::End,
+            11 => Self::Done,
+            12 => Self::Error,
+            13 => Self::Ping,
+            14 => Self::Pong,
+            15 => Self::Abort,
+            16 => Self::Log,
+            17 => Self::WsMessage,
             other => return Err(BwpError::UnknownKind(other)),
         })
     }
@@ -116,19 +153,23 @@ impl FrameHeader {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [FrameKind; 13] = [
+    const ALL_KINDS: [FrameKind; 17] = [
         FrameKind::Hello,
         FrameKind::HelloAck,
         FrameKind::Request,
+        FrameKind::RequestBody,
+        FrameKind::Retire,
+        FrameKind::Claim,
         FrameKind::ResponseHeaders,
         FrameKind::ResponseBody,
+        FrameKind::Flush,
         FrameKind::End,
+        FrameKind::Done,
         FrameKind::Error,
+        FrameKind::Ping,
+        FrameKind::Pong,
+        FrameKind::Abort,
         FrameKind::Log,
-        FrameKind::Ready,
-        FrameKind::Claim,
-        FrameKind::Retire,
-        FrameKind::RequestBody,
         FrameKind::WsMessage,
     ];
 
@@ -142,7 +183,7 @@ mod tests {
 
     #[test]
     fn frame_kind_rejects_unknown_discriminants() {
-        for byte in [0u8, 14, 100, 255] {
+        for byte in [0u8, 18, 100, 255] {
             match FrameKind::try_from(byte) {
                 Err(BwpError::UnknownKind(v)) => assert_eq!(v, byte),
                 other => panic!("expected UnknownKind({byte}), got {other:?}"),
@@ -175,6 +216,16 @@ mod tests {
         assert_eq!(decoded.request_id, h.request_id);
         assert_eq!(decoded.payload_len, h.payload_len);
         assert_eq!(decoded.aux, h.aux);
+    }
+
+    #[test]
+    fn pong_carries_request_id_and_status() {
+        let mut h = FrameHeader::new(FrameKind::Pong, 77, 0);
+        h.aux = crate::PONG_BUSY;
+        let decoded = FrameHeader::decode(&h.encode()).unwrap();
+        assert_eq!(decoded.kind, FrameKind::Pong);
+        assert_eq!(decoded.request_id, 77);
+        assert_eq!(decoded.aux, crate::PONG_BUSY);
     }
 
     #[test]

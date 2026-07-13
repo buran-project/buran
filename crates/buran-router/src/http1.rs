@@ -727,7 +727,16 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
     let (status, worker_headers) = match next_event(&mut worker, pool.first_event_timeout()).await
     {
         Some(WorkerEvent::Headers { status, headers }) => (status, headers),
-        Some(_) | None => {
+        // No output within response_timeout: the worker stalled while the
+        // client waited. next_event already sent Abort; fail with 504 (the
+        // task_timeout sweep, not us, decides whether to kill).
+        None => {
+            abort_feed(&feed);
+            write_simple(wr, 504, "Gateway Timeout", keep_alive).await?;
+            return Ok(AppRes::Http(504, None));
+        }
+        // A non-Headers first event is a worker bug.
+        Some(_) => {
             abort_feed(&feed);
             write_simple(wr, 502, "Bad Gateway", keep_alive).await?;
             return Ok(AppRes::Http(502, None));
@@ -747,22 +756,41 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
 
     // Hybrid framing: buffer up to the threshold; a response completing
     // within it goes out with content-length, larger ones stream chunked.
+    // An explicit worker flush (SSE) also forces the streaming path so the
+    // client sees bytes without waiting for the buffer to fill.
     const STREAM_THRESHOLD: usize = 64 * 1024;
     let mut buffered: Vec<u8> = Vec::new();
     let mut complete = false;
     let mut failed = false;
+    let mut stalled = false;
+    let mut flush_requested = false;
 
-    while !complete && !failed && buffered.len() <= STREAM_THRESHOLD {
+    while !complete && !failed && !stalled && !flush_requested && buffered.len() <= STREAM_THRESHOLD
+    {
         match next_event(&mut worker, event_timeout).await {
             Some(WorkerEvent::Chunk(chunk)) => buffered.extend_from_slice(&chunk),
+            Some(WorkerEvent::Flush) => flush_requested = true,
             Some(WorkerEvent::End) => {
                 complete = true;
             }
             Some(WorkerEvent::Headers { .. } | WorkerEvent::Ws { .. }) => {}
-            Some(WorkerEvent::Failed(_)) | None => {
+            Some(WorkerEvent::Failed(_)) => {
                 failed = true;
             }
+            // Stall while the client waits: 504 (Abort already sent).
+            None => {
+                stalled = true;
+            }
         }
+    }
+
+    if stalled {
+        // Headers arrived but the body stalled past response_timeout. Nothing
+        // is on the wire yet (still buffering), so answer a clean 504; the
+        // task keeps running until it winds down or the sweep kills it.
+        abort_feed(&feed);
+        write_simple(wr, 504, "Gateway Timeout", keep_alive).await?;
+        return Ok(AppRes::Http(504, None));
     }
 
     let mut head =
@@ -814,15 +842,66 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         return Ok(AppRes::Http(status, reclaim_rd(feed).await));
     }
 
-    // Streaming path.
+    // Streaming path: the buffer grew past the threshold, or the worker
+    // flushed (SSE / progressive output).
     head.push_str("transfer-encoding: chunked\r\n\r\n");
     wr.write_all(head.as_bytes()).await?;
     write_chunk(wr, &buffered).await?;
     drop(buffered);
 
+    // A flushed stream is long-lived: inter-event gaps are normal, so it uses
+    // the idle budget and flushes every chunk for real-time delivery. A
+    // threshold stream (large bulk body) keeps the strict per-event budget and
+    // lets TCP batch the writes for throughput.
+    let mut streaming = flush_requested;
+    let idle = Duration::from_secs(state.http.idle_timeout);
+    if streaming {
+        wr.flush().await?;
+    }
+
     loop {
-        match next_event(&mut worker, event_timeout).await {
-            Some(WorkerEvent::Chunk(chunk)) => write_chunk(wr, &chunk).await?,
+        // Flushed streams tolerate idle gaps and close gracefully on silence;
+        // bulk streams keep the strict per-event budget where a stall means a
+        // stuck worker (next_event marks it so).
+        let ev = if streaming {
+            match tokio::time::timeout(idle, worker.next_event()).await {
+                Ok(ev) => ev,
+                Err(_) => {
+                    // Prolonged silence: signal the worker its client is gone
+                    // (graceful, honors ignore_user_abort) and close.
+                    worker.send_abort().await;
+                    wr.write_all(b"0\r\n\r\n").await?;
+                    wr.flush().await?;
+                    drop(worker);
+                    return Ok(AppRes::Http(status, reclaim_rd(feed).await));
+                }
+            }
+        } else {
+            next_event(&mut worker, event_timeout).await
+        };
+
+        match ev {
+            Some(WorkerEvent::Chunk(chunk)) => {
+                let sent = async {
+                    write_chunk(wr, &chunk).await?;
+                    if streaming {
+                        wr.flush().await?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                }
+                .await;
+                if let Err(e) = sent {
+                    // Client hung up mid-stream: tell the worker so its handler
+                    // aborts (PHP user-abort) and the slot frees.
+                    worker.send_abort().await;
+                    abort_feed(&feed);
+                    return Err(e);
+                }
+            }
+            Some(WorkerEvent::Flush) => {
+                streaming = true;
+                wr.flush().await?;
+            }
             Some(WorkerEvent::End) => {
                 wr.write_all(b"0\r\n\r\n").await?;
                 wr.flush().await?;
@@ -831,8 +910,9 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
             }
             Some(WorkerEvent::Headers { .. } | WorkerEvent::Ws { .. }) => {}
             Some(WorkerEvent::Failed(_)) | None => {
-                // Mid-stream failure: truncate; the missing final chunk
-                // tells the client the response is broken.
+                // Worker error, or a bulk-stream stall (already marked stuck).
+                // Truncate: the missing final chunk tells the client the
+                // response is broken.
                 wr.flush().await?;
                 abort_feed(&feed);
                 return Err(std::io::Error::other("worker failed mid-stream"));
@@ -841,9 +921,10 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
     }
 }
 
-/// One event with the limits.timeout budget; None = stall. The request is
-/// abandoned and counted against the claiming worker's health — a worker
-/// with every granted slot stuck gets killed by the pool.
+/// One event with the `limits.response_timeout` budget; `None` = the worker
+/// produced nothing while the client waited. The worker is told to wind down
+/// (`Abort`), but NOT killed — that is the `task_timeout` sweep's job. The
+/// caller fails the client (504).
 async fn next_event(
     worker: &mut crate::dispatch::ResponseStream,
     timeout: Duration,
@@ -851,7 +932,7 @@ async fn next_event(
     match tokio::time::timeout(timeout, worker.next_event()).await {
         Ok(ev) => ev,
         Err(_) => {
-            worker.mark_stuck();
+            worker.send_abort().await;
             None
         }
     }

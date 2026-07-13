@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/buran-project/buran"
@@ -22,7 +22,7 @@ rust-version = "1.85"
 # (buran-worker -> buran-ipc) — crates.io resolves the registry copy by it.
 # The rest stay path-only; their crates are publish = false.
 buran-config = { path = "crates/buran-config" }
-buran-ipc = { path = "crates/buran-ipc", version = "0.1.0" }
+buran-ipc = { path = "crates/buran-ipc", version = "0.2.0" }
 buran-router = { path = "crates/buran-router" }
 buran-worker = { path = "crates/buran-worker" }
 
@@ -35,7 +35,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.31", features = ["socket", "uio", "process", "signal", "user", "fs"] }
-rustix = { version = "1.0", features = ["fs", "net", "process"] }
+rustix = { version = "1.0", features = ["fs", "net", "process", "event"] }
 httparse = "1.9"
 async-channel = "2"
 regex = "1"

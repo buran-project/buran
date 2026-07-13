@@ -115,6 +115,47 @@ routes:
     }
 
     #[test]
+    fn task_timeout_below_response_timeout_is_rejected() {
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action: { application: app }
+applications:
+  app:
+    module: test
+    limits:
+      response_timeout: 60
+      task_timeout: 30
+";
+        match err(yaml) {
+            ConfigError::Invalid { path, .. } => {
+                assert!(path.ends_with("limits.task_timeout"), "path: {path}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_limits_defaults_are_ordered() {
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action: { application: app }
+applications:
+  app:
+    module: test
+";
+        let app = from_str(yaml).unwrap().applications.get("app").unwrap().clone();
+        assert_eq!(app.limits.response_timeout, 60);
+        assert_eq!(app.limits.task_timeout, 300);
+        assert!(app.limits.task_timeout >= app.limits.response_timeout);
+    }
+
+    #[test]
     fn anchor_is_forbidden() {
         let yaml = "\
 listeners:

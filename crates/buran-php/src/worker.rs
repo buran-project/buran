@@ -61,6 +61,10 @@ struct RequestCtx {
     headers_sent: bool,
     /// Set by fastcgi_finish_request(): the client is gone, swallow output.
     client_released: bool,
+    /// Set when a write to the router fails (client hung up mid-stream):
+    /// ub_write then reports a short write so PHP aborts the connection and
+    /// the worker is freed instead of looping forever (SSE).
+    client_gone: bool,
 }
 
 thread_local! {
@@ -115,17 +119,22 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
 /// Serve requests on an already-booted engine. Forked workers land here;
 /// they exit without engine shutdown (FPM practice — the request boundary
 /// is `php_request_startup/shutdown`, the process just dies).
-pub fn serve(work: &UnixDatagram, stream: UnixStream, app: &AppConfig) -> Result<(), WorkerError> {
+pub fn serve(
+    work: &UnixDatagram,
+    stream: UnixStream,
+    app: &AppConfig,
+    token: u64,
+) -> Result<(), WorkerError> {
     let work = work.try_clone()?;
-    buran_worker::run(work, stream, app.max_requests, |req, flags, resp| {
+    buran_worker::run(work, stream, app.max_requests, token, |req, flags, resp| {
         handle(req, flags, resp, app)
     })
 }
 
-/// Entry point for standalone `--channel` mode (no prototype).
+/// Entry point for standalone `--channel` mode (no prototype, so no token).
 pub fn run(work: &UnixDatagram, stream: UnixStream, app: AppConfig) -> Result<(), WorkerError> {
     boot(&app)?;
-    let result = serve(work, stream, &app);
+    let result = serve(work, stream, &app, 0);
     unsafe { ffi::bphp_sapi_shutdown() };
     result
 }
@@ -228,6 +237,7 @@ fn handle(
         resp_headers: Vec::with_capacity(256),
         headers_sent: false,
         client_released: false,
+        client_gone: false,
     };
 
     CTX.with(|slot| *slot.borrow_mut() = Some(ctx));
@@ -425,12 +435,47 @@ pub extern "C" fn buran_cb_ub_write(str_: *const c_char, len: usize) -> usize {
     let chunk = unsafe { std::slice::from_raw_parts(str_ as *const u8, len) };
     with_ctx(|ctx| {
         if ctx.client_released {
-            return; // client already answered: swallow, FPM-style
+            return len; // fastcgi_finish_request: swallow, keep running
+        }
+        if ctx.client_gone {
+            return 0; // disconnected earlier: keep signalling the abort
         }
         let resp = responder(ctx);
-        let _ = resp.send_body(chunk);
+        if resp.send_body(chunk).is_err() {
+            // Broken pipe: a short write makes PHP abort the connection so
+            // the worker stops instead of looping (SSE with the client gone).
+            ctx.client_gone = true;
+            return 0;
+        }
+        len
+    })
+    .unwrap_or(0)
+}
+
+/// PHP flush() / ob_flush(): push buffered output to the client now and keep
+/// the response open (SSE, progressive output).
+#[unsafe(no_mangle)]
+pub extern "C" fn buran_cb_flush() {
+    with_ctx(|ctx| {
+        if ctx.client_released || ctx.client_gone {
+            return;
+        }
+        // Headers must precede the first flushed body bytes.
+        if !ctx.headers_sent {
+            let status = ctx.resp_status;
+            let headers = std::mem::take(&mut ctx.resp_headers);
+            let resp = responder(ctx);
+            if resp.send_headers(status, &headers).is_err() {
+                ctx.client_gone = true;
+                return;
+            }
+            ctx.headers_sent = true;
+        }
+        let resp = responder(ctx);
+        if resp.flush().is_err() {
+            ctx.client_gone = true;
+        }
     });
-    len
 }
 
 #[unsafe(no_mangle)]

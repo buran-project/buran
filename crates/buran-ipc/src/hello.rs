@@ -14,16 +14,21 @@ pub const CONCURRENCY_UNBOUNDED: u32 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hello {
     pub version: u32,
-    /// Worker process id: lets the router kill a wedged worker precisely.
+    /// Worker process id: diagnostics/logging only. Killing goes through the
+    /// worker's parent (prototype) by `token`, not this pid (pid-reuse safe).
     pub pid: u32,
     /// Requests the worker can process at once: 1 for blocking runtimes,
     /// N for event loops, CONCURRENCY_UNBOUNDED for "whatever arrives".
     pub concurrency: u32,
     /// CAP_* bit set.
     pub capabilities: u32,
+    /// Stable identity assigned by whoever spawned the worker (prototype /
+    /// supervisor). The router references it in kill commands; the spawner
+    /// maps it to a pidfd. 0 = none (standalone/diagnostic).
+    pub token: u64,
 }
 
-pub const HELLO_PAYLOAD_LEN: usize = 4 + 4 * 4;
+pub const HELLO_PAYLOAD_LEN: usize = 4 + 4 * 4 + 8;
 
 impl Hello {
     pub fn encode(&self) -> [u8; HELLO_PAYLOAD_LEN] {
@@ -33,6 +38,7 @@ impl Hello {
         buf[8..12].copy_from_slice(&self.pid.to_le_bytes());
         buf[12..16].copy_from_slice(&self.concurrency.to_le_bytes());
         buf[16..20].copy_from_slice(&self.capabilities.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.token.to_le_bytes());
         buf
     }
 
@@ -51,6 +57,7 @@ impl Hello {
             pid: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
             concurrency: u32::from_le_bytes(payload[12..16].try_into().unwrap()),
             capabilities: u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+            token: u64::from_le_bytes(payload[20..28].try_into().unwrap()),
         })
     }
 }
@@ -94,13 +101,14 @@ mod tests {
 
     #[test]
     fn hello_roundtrips() {
-        let h = Hello { version: 1, pid: 4242, concurrency: 128, capabilities: 0b1 };
+        let h = Hello { version: 1, pid: 4242, concurrency: 128, capabilities: 0b1, token: 99 };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
     }
 
     #[test]
     fn hello_rejects_bad_magic() {
-        let mut buf = Hello { version: 1, pid: 1, concurrency: 1, capabilities: 0 }.encode();
+        let mut buf =
+            Hello { version: 1, pid: 1, concurrency: 1, capabilities: 0, token: 0 }.encode();
         buf[0] = b'X';
         assert!(matches!(Hello::decode(&buf), Err(BwpError::BadMagic)));
     }

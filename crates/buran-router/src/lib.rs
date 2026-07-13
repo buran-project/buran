@@ -13,7 +13,7 @@ mod template;
 mod uri;
 mod ws;
 
-pub use dispatch::{DispatchError, Pool, ResponseStream, Spawner, SubmitBody, WorkerEvent};
+pub use dispatch::{DispatchError, Pool, ResponseStream, Spawn, Spawner, SubmitBody, WorkerEvent};
 pub use routes::CompiledRoutes;
 
 use std::collections::BTreeMap;

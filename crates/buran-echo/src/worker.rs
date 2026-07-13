@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use buran_ipc::{
     FrameHeader, FrameKind, Hello, HelloAck, RequestView, BWP_VERSION, CAP_BODY_STREAM,
     CAP_WEBSOCKET, CONCURRENCY_UNBOUNDED, FLAG_BODY_FILE, FLAG_BODY_STREAM, FLAG_UPGRADE,
-    FRAME_HEADER_LEN, WS_OP_BINARY, WS_OP_CLOSE, WS_OP_TEXT,
+    FRAME_HEADER_LEN, PONG_BUSY, PONG_IDLE, WS_OP_BINARY, WS_OP_CLOSE, WS_OP_TEXT,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
@@ -48,20 +48,26 @@ enum Inbound {
 /// Per-request inbound frames are routed here by the reader task.
 type BodyRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<Inbound>>>>;
 
+/// In-flight handlers by request id (also the "busy" set for Ping); the value
+/// is the handler's abort handle so an `Abort` can cancel it.
+type InFlight = Arc<Mutex<HashMap<u32, tokio::task::AbortHandle>>>;
+
 pub fn serve(
     work: std::os::unix::net::UnixDatagram,
     stream: std::os::unix::net::UnixStream,
     app: &AppConfig,
+    token: u64,
 ) -> std::io::Result<()> {
     // The runtime is built here, strictly after the prototype's fork.
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(run(work, stream, app))
+    rt.block_on(run(work, stream, app, token))
 }
 
 async fn run(
     work: std::os::unix::net::UnixDatagram,
     stream: std::os::unix::net::UnixStream,
     app: &AppConfig,
+    token: u64,
 ) -> std::io::Result<()> {
     work.set_nonblocking(true)?;
     stream.set_nonblocking(true)?;
@@ -77,6 +83,7 @@ async fn run(
         pid: std::process::id(),
         concurrency: CONCURRENCY_UNBOUNDED,
         capabilities: CAP_BODY_STREAM | CAP_WEBSOCKET,
+        token,
     }
     .encode();
     let mut msg = Vec::with_capacity(FRAME_HEADER_LEN + hello.len());
@@ -104,9 +111,12 @@ async fn run(
         }
     });
 
-    // Reader task: routes RequestBody frames to their requests.
+    // Reader task: routes RequestBody frames to their requests and answers
+    // liveness Pings / task Aborts. `inflight` maps a request to its handler's
+    // abort handle (also the "busy" set for Ping).
     let bodies: BodyRoutes = Arc::new(Mutex::new(HashMap::new()));
-    tokio::spawn(route_bodies(rd, Arc::clone(&bodies)));
+    let inflight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(route_bodies(rd, Arc::clone(&bodies), Arc::clone(&inflight), out_tx.clone()));
 
     let sem = Arc::new(Semaphore::new(granted as usize));
     let mut served: u64 = 0;
@@ -160,12 +170,17 @@ async fn run(
         }
 
         let out = out_tx.clone();
-        let bodies = Arc::clone(&bodies);
-        tokio::spawn(async move {
+        let bodies_c = Arc::clone(&bodies);
+        let inflight_c = Arc::clone(&inflight);
+        let jh = tokio::spawn(async move {
             let _permit = permit; // slot is held until the response is out
             handle_request(payload, header.flags, id, body_rx, out).await;
-            bodies.lock().expect("bodies lock").remove(&id);
+            bodies_c.lock().expect("bodies lock").remove(&id);
+            inflight_c.lock().expect("inflight lock").remove(&id);
         });
+        // Single-threaded runtime: the task cannot run until we await, so this
+        // insert always precedes the handler's self-removal.
+        inflight.lock().expect("inflight lock").insert(id, jh.abort_handle());
 
         served += 1;
         if app.max_requests > 0 && served >= app.max_requests {
@@ -206,7 +221,10 @@ async fn handle_request(
                 &FrameHeader::new(FrameKind::ResponseBody, id, body.len() as u32),
                 &body,
             );
+            // End releases the client, Done frees the slot (no background here,
+            // so they go back to back).
             push_frame(&mut buf, &FrameHeader::new(FrameKind::End, id, 0), &[]);
+            push_frame(&mut buf, &FrameHeader::new(FrameKind::Done, id, 0), &[]);
         }
         Err(msg) => {
             push_frame(
@@ -252,8 +270,9 @@ async fn ws_session(id: u32, body_rx: Option<mpsc::Receiver<Inbound>>, out: mpsc
         }
     }
 
-    let mut end = Vec::with_capacity(FRAME_HEADER_LEN);
+    let mut end = Vec::with_capacity(2 * FRAME_HEADER_LEN);
     push_frame(&mut end, &FrameHeader::new(FrameKind::End, id, 0), &[]);
+    push_frame(&mut end, &FrameHeader::new(FrameKind::Done, id, 0), &[]);
     let _ = out.send(end).await;
 }
 
@@ -313,20 +332,45 @@ async fn read_body(
     }
 }
 
-/// Reader half of the response stream: after the handshake the router
-/// sends RequestBody and WsMessage frames here. Body terminators
-/// (zero-length payloads) pass through as empty chunks.
-async fn route_bodies(mut rd: BufReader<OwnedReadHalf>, bodies: BodyRoutes) {
+/// Reader half of the response stream: after the handshake the router sends
+/// RequestBody / WsMessage (per-request), plus liveness Pings and task Aborts.
+async fn route_bodies(
+    mut rd: BufReader<OwnedReadHalf>,
+    bodies: BodyRoutes,
+    inflight: InFlight,
+    out: mpsc::Sender<Vec<u8>>,
+) {
     loop {
         let Ok((header, payload)) = read_frame(&mut rd).await else {
             return; // router gone; in-flight handlers finish on their own
         };
+        let id = header.request_id;
         let inbound = match header.kind {
             FrameKind::RequestBody => Inbound::Body(payload),
             FrameKind::WsMessage => Inbound::Ws(header.aux, payload),
+            // Liveness probe: alive; busy iff the task is still running.
+            FrameKind::Ping => {
+                let busy = inflight.lock().expect("inflight lock").contains_key(&id);
+                let mut pong = FrameHeader::new(FrameKind::Pong, id, 0);
+                pong.aux = if busy { PONG_BUSY } else { PONG_IDLE };
+                let _ = out.send(pong.encode().to_vec()).await;
+                continue;
+            }
+            // Cooperative cancel: abort the handler and free the slot (Done).
+            FrameKind::Abort => {
+                // Take the handle (drops the guard) before any await.
+                let handle = inflight.lock().expect("inflight lock").remove(&id);
+                if let Some(handle) = handle {
+                    handle.abort();
+                    bodies.lock().expect("bodies lock").remove(&id);
+                    let done = FrameHeader::new(FrameKind::Done, id, 0).encode().to_vec();
+                    let _ = out.send(done).await;
+                }
+                continue;
+            }
             _ => continue,
         };
-        let tx = bodies.lock().expect("bodies lock").get(&header.request_id).cloned();
+        let tx = bodies.lock().expect("bodies lock").get(&id).cloned();
         if let Some(tx) = tx {
             // A closed receiver (request already finished) just drops the
             // frame — that is the "drain after early response" contract.
@@ -359,7 +403,42 @@ async fn read_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buran_ipc::RequestBuilder;
+    use buran_ipc::{RequestBuilder, PONG_BUSY};
+
+    #[tokio::test]
+    async fn route_bodies_answers_ping_and_aborts_task() {
+        let (router, worker) = UnixStream::pair().unwrap();
+        let (worker_rd, _worker_wr) = worker.into_split();
+        let (_router_rd, mut router_wr) = router.into_split();
+
+        let bodies: BodyRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let inflight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(8);
+        tokio::spawn(route_bodies(
+            BufReader::new(worker_rd),
+            Arc::clone(&bodies),
+            Arc::clone(&inflight),
+            out_tx,
+        ));
+
+        // A running handler for request 5.
+        let handler = tokio::spawn(async { std::future::pending::<()>().await });
+        inflight.lock().unwrap().insert(5, handler.abort_handle());
+
+        // Ping(5) -> Pong: busy.
+        router_wr.write_all(&FrameHeader::new(FrameKind::Ping, 5, 0).encode()).await.unwrap();
+        let pong = out_rx.recv().await.unwrap();
+        let h = FrameHeader::decode(pong[..FRAME_HEADER_LEN].try_into().unwrap()).unwrap();
+        assert_eq!((h.kind, h.request_id, h.aux), (FrameKind::Pong, 5, PONG_BUSY));
+
+        // Abort(5) -> handler cancelled, Done(5) frees the slot.
+        router_wr.write_all(&FrameHeader::new(FrameKind::Abort, 5, 0).encode()).await.unwrap();
+        let done = out_rx.recv().await.unwrap();
+        let h = FrameHeader::decode(done[..FRAME_HEADER_LEN].try_into().unwrap()).unwrap();
+        assert_eq!((h.kind, h.request_id), (FrameKind::Done, 5));
+        assert!(handler.await.unwrap_err().is_cancelled());
+        assert!(!inflight.lock().unwrap().contains_key(&5));
+    }
 
     /// Split batched output buffers into (header, payload) frames.
     fn frames(bufs: Vec<Vec<u8>>) -> Vec<(FrameHeader, Vec<u8>)> {
@@ -398,13 +477,15 @@ mod tests {
         session.await.unwrap();
 
         let f = frames(drain(out_rx).await);
-        assert_eq!(f.len(), 4);
+        assert_eq!(f.len(), 5);
         assert_eq!((f[0].0.kind, f[0].0.aux), (FrameKind::ResponseHeaders, 101));
         assert_eq!((f[1].0.kind, f[1].0.aux), (FrameKind::WsMessage, WS_OP_TEXT));
         assert_eq!(f[1].1, b"marco");
         assert_eq!((f[2].0.kind, f[2].0.aux), (FrameKind::WsMessage, WS_OP_BINARY));
         assert_eq!(f[2].1, vec![1, 2, 3]);
+        // End releases the client, Done frees the slot.
         assert_eq!((f[3].0.kind, f[3].0.request_id), (FrameKind::End, 7));
+        assert_eq!((f[4].0.kind, f[4].0.request_id), (FrameKind::Done, 7));
     }
 
     #[tokio::test]
@@ -416,7 +497,9 @@ mod tests {
         session.await.unwrap();
 
         let f = frames(drain(out_rx).await);
-        assert_eq!(f.last().unwrap().0.kind, FrameKind::End);
+        // Terminates with End then Done.
+        assert_eq!(f[f.len() - 2].0.kind, FrameKind::End);
+        assert_eq!(f.last().unwrap().0.kind, FrameKind::Done);
     }
 
     #[tokio::test]

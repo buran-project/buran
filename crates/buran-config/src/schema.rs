@@ -94,7 +94,7 @@ impl Default for HttpSettings {
 }
 
 /// Upgraded (WebSocket) connections live outside the regular HTTP budgets:
-/// limits.timeout and http.idle_timeout do not apply to them.
+/// the request limits and http.idle_timeout do not apply to them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WebsocketSettings {
@@ -294,14 +294,27 @@ impl Default for Queue {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
-    /// Seconds a worker may spend on one request before SIGKILL + respawn.
-    pub timeout: u64,
+    /// Seconds the router waits for the worker's next output while a client is
+    /// attached. Exceeded -> 504 to the client + Abort to the worker; the
+    /// worker is NOT killed (analogue of nginx `fastcgi_read_timeout`).
+    pub response_timeout: u64,
+    /// Seconds a worker may spend on one task in total, including background
+    /// work after `fastcgi_finish_request`. Exceeded -> Abort; the worker is
+    /// killed only if it refuses to wind down (analogue of fpm
+    /// `request_terminate_timeout`, but wall-clock and background-inclusive).
+    pub task_timeout: u64,
     /// Worker is recycled after this many requests (0 = never).
     pub requests: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { timeout: 30, requests: 0 }
+        Self { response_timeout: 60, task_timeout: 300, requests: 0 }
     }
 }
+
+/// Effective per-worker concurrency applied when a module declares
+/// `CONCURRENCY_UNBOUNDED` and the application sets no `concurrency` cap: a
+/// finite ceiling so the reaping/backstop always has a bound (memory is
+/// separately bounded pool-wide by `queue.max`).
+pub const DEFAULT_CONCURRENCY_CAP: u32 = 1024;

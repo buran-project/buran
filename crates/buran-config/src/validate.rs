@@ -258,6 +258,18 @@ fn validate_application(app: &Application, path: &str) -> Result<(), ConfigError
         return Err(ConfigError::invalid(format!("{path}.queue.max"), "must be >= 1"));
     }
 
+    // task_timeout is the total wall-clock budget; response_timeout is a
+    // shorter client-facing wait inside it. Inverting them is nonsensical.
+    if app.limits.task_timeout < app.limits.response_timeout {
+        return Err(ConfigError::invalid(
+            format!("{path}.limits.task_timeout"),
+            format!(
+                "task_timeout ({}) must be >= response_timeout ({})",
+                app.limits.task_timeout, app.limits.response_timeout
+            ),
+        ));
+    }
+
     for ext in &app.execute {
         if !ext.starts_with('.') || ext.len() < 2 {
             return Err(ConfigError::invalid(

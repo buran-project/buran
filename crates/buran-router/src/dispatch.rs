@@ -15,12 +15,13 @@
 //! client path, not in the worker's critical path.
 //!
 //! Saturation contract (spec 2.9):
-//! - `queue.max`     = semaphore permits; none left -> instant 503;
-//! - `queue.timeout` = deadline for the first sign of life (Claim);
-//! - `limits.timeout`= per-event budget enforced by the caller. A stall
-//!   fails the request, not the worker: the caller marks it stuck and only
-//!   a worker whose every granted slot is stuck gets SIGKILLed (for
+//! - `queue.max`            = semaphore permits; none left -> instant 503;
+//! - `queue.timeout`        = deadline for the first sign of life (Claim);
+//! - `limits.response_timeout` = per-event budget enforced by the caller. A
+//!   stall fails the request, not the worker: the caller marks it stuck and
+//!   only a worker whose every granted slot is stuck gets SIGKILLed (for
 //!   concurrency 1 that is exactly the old kill-on-timeout semantics).
+//!   (`limits.task_timeout` — total wall-clock incl. background — lands in Ф4.)
 //!
 //! Crash semantics: datagrams a dead worker never consumed stay queued for
 //! the survivors; every request it had claimed fails.
@@ -28,9 +29,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use buran_config::{Application, Processes};
+use buran_config::{Application, Processes, DEFAULT_CONCURRENCY_CAP};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixDatagram;
@@ -39,11 +40,21 @@ use tracing::{error, info, warn};
 use buran_ipc::{
     FrameHeader, FrameKind, Hello, HelloAck, BWP_VERSION, CAP_BODY_STREAM, CAP_WEBSOCKET,
     CONCURRENCY_UNBOUNDED, FLAG_BODY_FILE, FLAG_BODY_STREAM, FLAG_UPGRADE, FRAME_HEADER_LEN,
+    PONG_IDLE,
 };
 
-/// Spawns one worker process and returns the router side of its response
-/// stream. Implemented by the supervisor (buran main).
-pub type Spawner = Arc<dyn Fn() -> anyhow::Result<tokio::net::UnixStream> + Send + Sync>;
+/// Worker lifecycle, owned by the supervisor (buran main): spawn a worker and
+/// kill one by the token it declared in Hello. Killing goes through the
+/// worker's parent (the prototype) so it is pid-reuse safe — the router never
+/// signals a pid directly.
+pub trait Spawn: Send + Sync {
+    /// Spawn one worker and return the router side of its response stream.
+    fn spawn(&self) -> anyhow::Result<tokio::net::UnixStream>;
+    /// Ask the prototype to SIGKILL the worker with this token. Best-effort.
+    fn kill(&self, token: u64);
+}
+
+pub type Spawner = Arc<dyn Spawn>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchError {
@@ -59,6 +70,8 @@ pub enum DispatchError {
 pub enum WorkerEvent {
     Headers { status: u16, headers: Vec<u8> },
     Chunk(Vec<u8>),
+    /// Worker asked to forward buffered output now (PHP `flush()` / SSE).
+    Flush,
     /// WebSocket message from the worker (upgraded requests only).
     Ws { opcode: u32, payload: Vec<u8> },
     End,
@@ -85,6 +98,12 @@ struct Pending {
     events: tokio::sync::mpsc::Sender<WorkerEvent>,
     /// Worker that claimed this request (key into `Pool::workers`).
     claimed_by: Option<u32>,
+    /// When the worker claimed it — start of the `task_timeout` wall-clock.
+    claimed_at: Option<Instant>,
+    /// The task_timeout sweep already sent an `Abort` for this task.
+    abort_sent: bool,
+    /// When the `Abort` was sent; a task still alive `grace` later is defiant.
+    aborted_at: Option<Instant>,
     /// Body chunk source for FLAG_BODY_STREAM requests; taken on Claim.
     body: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
@@ -94,15 +113,18 @@ struct Pending {
 struct WorkerState {
     name: String,
     pid: u32,
+    /// Stable identity from Hello: the router asks the prototype to kill by
+    /// this token (pid-reuse safe), never by `pid`.
+    token: u64,
     /// Effective concurrency granted in HelloAck (u32::MAX = unbounded).
     granted: u32,
     /// Write half of the worker's stream: HelloAck + RequestBody frames.
     /// Frames are locked whole so pumps of concurrent requests interleave
     /// at frame granularity.
     writer: tokio::sync::Mutex<OwnedWriteHalf>,
-    /// Requests abandoned by the router (timeout) that the worker still has
-    /// not finished. Every granted slot stuck = the worker is wedged.
-    abandoned: Mutex<HashSet<u32>>,
+    /// Set once the sweep asked the prototype to kill this worker, so repeated
+    /// sweep ticks do not re-send the command while it winds down.
+    kill_requested: std::sync::atomic::AtomicBool,
 }
 
 impl WorkerState {
@@ -138,6 +160,9 @@ pub struct Pool {
     queue: Arc<tokio::sync::Semaphore>,
     queue_timeout: Duration,
     request_timeout: Duration,
+    /// limits.task_timeout: total wall-clock a task may hold its slot before
+    /// the sweep aborts it and, if it will not wind down, kills the worker.
+    task_timeout: Duration,
     spawner: Spawner,
     app_name: String,
     max: u32,
@@ -156,6 +181,10 @@ pub struct Pool {
     /// Capabilities declared by this pool's workers (same homogeneity).
     caps: AtomicU32,
     workers: Mutex<HashMap<u32, Arc<WorkerState>>>,
+    /// In-flight liveness probes: request_id -> one-shot for the `Pong` status
+    /// (`PONG_IDLE`/`PONG_BUSY`). The sweep registers one before a `Ping`; the
+    /// reader completes it when the matching `Pong` arrives.
+    pings: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<u32>>>,
 }
 
 /// Payload larger than this spills to a temp file (datagram size budget)
@@ -192,7 +221,8 @@ impl Pool {
             next_id: AtomicU32::new(1),
             queue: Arc::new(tokio::sync::Semaphore::new(app.queue.max as usize)),
             queue_timeout: Duration::from_secs(app.queue.timeout),
-            request_timeout: Duration::from_secs(app.limits.timeout),
+            request_timeout: Duration::from_secs(app.limits.response_timeout),
+            task_timeout: Duration::from_secs(app.limits.task_timeout),
             spawner,
             app_name: app_name.to_string(),
             max,
@@ -205,6 +235,7 @@ impl Pool {
             granted: AtomicU32::new(0),
             caps: AtomicU32::new(0),
             workers: Mutex::new(HashMap::new()),
+            pings: Mutex::new(HashMap::new()),
         });
 
         for _ in 0..initial {
@@ -213,6 +244,7 @@ impl Pool {
         if let Some(idle_exit) = idle_exit {
             tokio::spawn(janitor(Arc::clone(&pool), idle_exit));
         }
+        tokio::spawn(task_timeout_sweep(Arc::clone(&pool)));
 
         Ok(pool)
     }
@@ -323,7 +355,17 @@ impl Pool {
         self.pending
             .lock()
             .expect("pending lock")
-            .insert(id, Pending { events: tx, claimed_by: None, body: body_rx });
+            .insert(
+                id,
+                Pending {
+                    events: tx,
+                    claimed_by: None,
+                    claimed_at: None,
+                    abort_sent: false,
+                    aborted_at: None,
+                    body: body_rx,
+                },
+            );
         self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
 
         let mut msg = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
@@ -360,41 +402,121 @@ impl Pool {
         }
     }
 
-    /// The caller gave up on request `id` (limits.timeout). The request is
-    /// counted against the worker that claimed it; a worker whose every
-    /// granted slot is stuck is wedged and gets SIGKILL — the respawn path
-    /// then fails whatever else it held.
-    fn mark_stuck(&self, id: u32) {
-        let claimed_by = self
-            .pending
-            .lock()
-            .expect("pending lock")
-            .get(&id)
-            .and_then(|p| p.claimed_by);
-        let Some(worker_id) = claimed_by else {
-            return; // never claimed: the datagram is lost or still queued
-        };
-        let Some(worker) = self.workers.lock().expect("workers lock").get(&worker_id).cloned()
-        else {
-            return; // already gone
-        };
+    /// Free the slot only if no worker claimed the request (lost datagram /
+    /// abandoned before a claim). A claimed task keeps its slot until its
+    /// `Done` (or the worker dies), so a `fastcgi_finish_request` background
+    /// task stays tracked past the client response.
+    fn remove_if_unclaimed(&self, id: u32) {
+        let mut pending = self.pending.lock().expect("pending lock");
+        if let Some(p) = pending.get(&id) {
+            if p.claimed_by.is_none() {
+                pending.remove(&id);
+                self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
 
-        let stuck = {
-            let mut abandoned = worker.abandoned.lock().expect("abandoned lock");
-            abandoned.insert(id);
-            abandoned.len() as u64
+    /// Send an `Abort` to the worker claiming task `id` (client gone, response
+    /// stall, or task over budget). Best-effort.
+    async fn abort_task(&self, id: u32) {
+        let worker = {
+            let claimed_by =
+                self.pending.lock().expect("pending lock").get(&id).and_then(|p| p.claimed_by);
+            let Some(worker_id) = claimed_by else { return };
+            self.workers.lock().expect("workers lock").get(&worker_id).cloned()
         };
-        warn!(
-            app = %self.app_name, worker = %worker.name, request = id, stuck,
-            "request timed out; abandoning"
-        );
-        // Unbounded workers (granted == MAX) are never declared wedged.
-        if stuck >= u64::from(worker.granted) {
-            error!(
-                app = %self.app_name, worker = %worker.name, pid = worker.pid,
-                "all {} slot(s) stuck; killing worker", worker.granted
-            );
-            kill_worker(worker.pid);
+        let Some(worker) = worker else { return };
+        let _ = worker.send_frame(&FrameHeader::new(FrameKind::Abort, id, 0), &[]).await;
+    }
+
+    /// One task_timeout pass (pure decision, no I/O): mark newly over-budget
+    /// tasks for `Abort`, count tasks still alive `grace` after their Abort as
+    /// defiant, and return `(ids to abort, kill candidates)`. A worker becomes
+    /// a candidate when its defiant slots reach the degradation threshold
+    /// (blocking: one slot; event loop: a majority). The final kill is gated by
+    /// an authoritative `Ping` (the caller), so a candidate that is actually
+    /// idle (reader lagged behind a `Done`) is spared.
+    fn sweep_decide(&self, now: Instant, grace: Duration) -> (Vec<u32>, Vec<KillCandidate>) {
+        let mut to_abort: Vec<u32> = Vec::new();
+        // worker_id -> (defiant count, a sample defiant task to probe).
+        let mut defiant: HashMap<u32, (u32, u32)> = HashMap::new();
+        {
+            let mut pending = self.pending.lock().expect("pending lock");
+            for (&id, p) in pending.iter_mut() {
+                let Some(claimed_at) = p.claimed_at else {
+                    continue; // never claimed: not our budget to enforce
+                };
+                if !p.abort_sent {
+                    if now.duration_since(claimed_at) >= self.task_timeout {
+                        p.abort_sent = true;
+                        p.aborted_at = Some(now);
+                        to_abort.push(id);
+                    }
+                } else if let Some(aborted_at) = p.aborted_at {
+                    if now.duration_since(aborted_at) >= grace {
+                        if let Some(w) = p.claimed_by {
+                            let e = defiant.entry(w).or_insert((0, id));
+                            e.0 += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut candidates: Vec<KillCandidate> = Vec::new();
+        if !defiant.is_empty() {
+            let workers = self.workers.lock().expect("workers lock");
+            for (worker_id, (count, probe_task)) in defiant {
+                let Some(worker) = workers.get(&worker_id) else { continue };
+                let threshold = (worker.granted / 2).max(1);
+                if count >= threshold && !worker.kill_requested.load(Ordering::Relaxed) {
+                    candidates.push(KillCandidate { worker_id, token: worker.token, probe_task });
+                }
+            }
+        }
+        (to_abort, candidates)
+    }
+
+    /// Liveness probe: `Ping` the worker about `task_id` and await its `Pong`
+    /// up to `deadline`. Returns the status (`PONG_IDLE`/`PONG_BUSY`), or None
+    /// if the worker is gone or did not answer (wedged event loop / stuck).
+    async fn probe(&self, worker_id: u32, task_id: u32, deadline: Duration) -> Option<u32> {
+        let worker = self.workers.lock().expect("workers lock").get(&worker_id).cloned()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pings.lock().expect("pings lock").insert(task_id, tx);
+        if worker.send_frame(&FrameHeader::new(FrameKind::Ping, task_id, 0), &[]).await.is_err() {
+            self.pings.lock().expect("pings lock").remove(&task_id);
+            return None;
+        }
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(status)) => Some(status),
+            _ => {
+                self.pings.lock().expect("pings lock").remove(&task_id);
+                None
+            }
+        }
+    }
+
+    /// Authoritative confirm before an irreversible kill, uniform for both
+    /// profiles. `Pong: idle` means the worker is actually free (its "defiant"
+    /// task finished and the reader lagged) -> spare it; `Pong: busy` or no
+    /// answer (wedged) -> kill via the prototype by token.
+    async fn confirm_and_kill(&self, candidates: Vec<KillCandidate>, deadline: Duration) {
+        for c in candidates {
+            if self.probe(c.worker_id, c.probe_task, deadline).await == Some(PONG_IDLE) {
+                continue;
+            }
+            let Some(worker) = self.workers.lock().expect("workers lock").get(&c.worker_id).cloned()
+            else {
+                continue;
+            };
+            if !worker.kill_requested.swap(true, Ordering::Relaxed) {
+                error!(
+                    app = %self.app_name, worker = %worker.name, pid = worker.pid,
+                    "task over budget and not winding down; killing"
+                );
+                self.spawner.kill(c.token);
+            }
         }
     }
 
@@ -418,7 +540,7 @@ impl Pool {
 
         tokio::spawn(async move {
             loop {
-                let stream = match (pool.spawner)() {
+                let stream = match pool.spawner.spawn() {
                     Ok(s) => s,
                     Err(e) => {
                         error!(worker = %name, "spawn failed: {e:#}; retrying in 1s");
@@ -452,14 +574,6 @@ impl Pool {
     }
 }
 
-fn kill_worker(pid: u32) {
-    let Ok(raw) = i32::try_from(pid) else { return };
-    let Some(pid) = rustix::process::Pid::from_raw(raw) else { return };
-    if let Err(e) = rustix::process::kill_process(pid, rustix::process::Signal::KILL) {
-        warn!("SIGKILL worker {raw}: {e}");
-    }
-}
-
 /// Hello -> HelloAck. The granted concurrency is the declared value capped
 /// by config; it also seeds the pool-wide capacity numbers (workers of one
 /// pool are homogeneous by design: same binary, same config).
@@ -482,7 +596,13 @@ async fn handshake(
         CONCURRENCY_UNBOUNDED => u32::MAX,
         n => n,
     };
-    let granted = declared.min(pool.concurrency_cap);
+    // Effective concurrency is always finite: an unbounded declaration with no
+    // config cap falls back to DEFAULT_CONCURRENCY_CAP so the reaping backstop
+    // and capacity math always have a bound (memory is bounded by queue.max).
+    let granted = match declared.min(pool.concurrency_cap) {
+        u32::MAX => DEFAULT_CONCURRENCY_CAP,
+        n => n,
+    };
     pool.granted.store(granted, Ordering::Relaxed);
     pool.caps.store(hello.capabilities, Ordering::Relaxed);
 
@@ -490,9 +610,10 @@ async fn handshake(
     let worker = Arc::new(WorkerState {
         name: name.to_string(),
         pid: hello.pid,
+        token: hello.token,
         granted,
         writer: tokio::sync::Mutex::new(writer),
-        abandoned: Mutex::new(HashSet::new()),
+        kill_requested: std::sync::atomic::AtomicBool::new(false),
     });
     let fh = FrameHeader::new(FrameKind::HelloAck, 0, ack.len() as u32);
     worker.send_frame(&fh, &ack).await?;
@@ -536,6 +657,7 @@ async fn reader_task(
                     match pending.get_mut(&id) {
                         Some(p) => {
                             p.claimed_by = Some(worker_id);
+                            p.claimed_at = Some(Instant::now()); // task_timeout starts
                             p.body.take()
                         }
                         // Already abandoned (timeout/disconnect before the
@@ -553,29 +675,55 @@ async fn reader_task(
                 headers: payload,
             },
             FrameKind::ResponseBody => WorkerEvent::Chunk(payload),
+            FrameKind::Flush => WorkerEvent::Flush,
             FrameKind::WsMessage => WorkerEvent::Ws { opcode: header.aux, payload },
-            FrameKind::End => {
-                claimed.remove(&id);
-                worker.abandoned.lock().expect("abandoned lock").remove(&id);
-                WorkerEvent::End
-            }
+            // Client response complete: forward it, but the task keeps its
+            // slot until `Done` (it may run in the background).
+            FrameKind::End => WorkerEvent::End,
             FrameKind::Error => {
                 warn!(worker = %worker.name, "worker error: {}", String::from_utf8_lossy(&payload));
                 claimed.remove(&id);
-                worker.abandoned.lock().expect("abandoned lock").remove(&id);
                 WorkerEvent::Failed(DispatchError::WorkerFailed)
+            }
+            // Task fully finished (including background): free the slot and
+            // stop tracking. Done subsumes End — it also releases the client if
+            // an `End` never arrived (aborted task, or a misbehaving module):
+            // in the normal `End`->`Done` flow this send is a no-op (the client
+            // already completed and dropped the receiver).
+            FrameKind::Done => {
+                claimed.remove(&id);
+                let sender = {
+                    let mut pending = pool.pending.lock().expect("pending lock");
+                    pending.remove(&id).map(|p| {
+                        pool.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+                        p.events
+                    })
+                };
+                if let Some(sender) = sender {
+                    let _ = sender.send(WorkerEvent::End).await;
+                }
+                continue;
             }
             FrameKind::Log => {
                 info!("worker: {}", String::from_utf8_lossy(&payload));
                 continue;
             }
+            // Liveness reply: complete the sweep's probe with the status.
+            FrameKind::Pong => {
+                if let Some(tx) = pool.pings.lock().expect("pings lock").remove(&id) {
+                    let _ = tx.send(header.aux);
+                }
+                continue;
+            }
             _ => continue,
         };
 
-        let is_end = matches!(event, WorkerEvent::End | WorkerEvent::Failed(_));
+        // Only `Error` is terminal for the slot here; `End` forwards but keeps
+        // the task tracked until its `Done`.
+        let is_terminal = matches!(event, WorkerEvent::Failed(_));
         let sender = {
             let mut pending = pool.pending.lock().expect("pending lock");
-            if is_end {
+            if is_terminal {
                 pending.remove(&id).map(|p| {
                     pool.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
                     p.events
@@ -634,6 +782,38 @@ async fn janitor(pool: Arc<Pool>, idle_exit: Duration) {
     }
 }
 
+/// Wall-clock enforcement of `task_timeout` (the resource backstop covering
+/// post-finish_request background). Each tick: a claimed task past
+/// `task_timeout` gets one `Abort`; a task still alive `TASK_ABORT_GRACE` after
+/// its `Abort` is "defiant"; a worker whose defiant slots cross the degradation
+/// threshold is killed via the prototype (by token) and respawned. For blocking
+/// workers (granted 1) one defiant slot is the whole worker; event loops need a
+/// majority (an isolated stuck task just costs a slot).
+/// Grace after an `Abort` before a still-alive task is declared defiant.
+const TASK_ABORT_GRACE: Duration = Duration::from_secs(5);
+/// How long the sweep waits for a `Pong` before treating the worker as wedged.
+const PROBE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// A worker the sweep wants to kill, pending an authoritative liveness probe.
+struct KillCandidate {
+    worker_id: u32,
+    token: u64,
+    /// A defiant task to probe (`Ping` carries it; `Pong` echoes it).
+    probe_task: u32,
+}
+
+async fn task_timeout_sweep(pool: Arc<Pool>) {
+    let tick = (pool.task_timeout / 4).clamp(Duration::from_secs(1), Duration::from_secs(5));
+    loop {
+        tokio::time::sleep(tick).await;
+        let (to_abort, candidates) = pool.sweep_decide(Instant::now(), TASK_ABORT_GRACE);
+        for id in to_abort {
+            pool.abort_task(id).await;
+        }
+        pool.confirm_and_kill(candidates, PROBE_DEADLINE).await;
+    }
+}
+
 /// Response stream for one submitted request. Dropping it abandons the
 /// request: late frames are discarded by the reader task.
 /// A reserved queue slot, held for the request's lifetime.
@@ -651,11 +831,12 @@ impl ResponseStream {
         self.rx.recv().await
     }
 
-    /// The caller's per-event budget ran out. Distinguishes a genuine stall
-    /// from a client disconnect (plain drop): only stalls count against the
-    /// worker's health.
-    pub fn mark_stuck(&self) {
-        self.pool.mark_stuck(self.id);
+    /// Tell the claiming worker that this request's client is gone, so it can
+    /// abort the runtime handler (PHP user-abort, honoring the app's abort
+    /// policy). Best-effort: if the request was never claimed or the worker
+    /// has already left, there is nothing to abort.
+    pub async fn send_abort(&self) {
+        self.pool.abort_task(self.id).await;
     }
 
     /// Send one WebSocket message to the worker that claimed this request
@@ -686,9 +867,10 @@ impl ResponseStream {
 
 impl Drop for ResponseStream {
     fn drop(&mut self) {
-        // Normal completion already removed the entry; this covers timeouts
-        // and client disconnects.
-        self.pool.remove_pending(self.id);
+        // Free the slot only if the task was never claimed; a claimed task
+        // frees on its `Done` (or worker death), so background work outlives
+        // the client response.
+        self.pool.remove_if_unclaimed(self.id);
     }
 }
 
@@ -738,7 +920,7 @@ async fn read_frame(stream: &mut BufReader<OwnedReadHalf>) -> std::io::Result<(F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buran_ipc::{RequestBuilder, WS_OP_TEXT};
+    use buran_ipc::{RequestBuilder, PONG_BUSY, PONG_IDLE, WS_OP_TEXT};
     use tokio::net::UnixStream;
     use tokio::time::timeout;
 
@@ -764,18 +946,31 @@ applications:
         buran_config::from_str(&yaml).unwrap().applications.get("app").unwrap().clone()
     }
 
-    /// Spawner that hands the worker-side stream ends to the test.
-    fn test_spawner() -> (Spawner, tokio::sync::mpsc::UnboundedReceiver<UnixStream>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let spawner: Spawner = Arc::new(move || {
+    /// Spawner that hands the worker-side stream ends to the test and records
+    /// the tokens the pool asks to kill.
+    struct TestSpawner {
+        tx: tokio::sync::mpsc::UnboundedSender<UnixStream>,
+        killed: Mutex<Vec<u64>>,
+    }
+
+    impl Spawn for TestSpawner {
+        fn spawn(&self) -> anyhow::Result<tokio::net::UnixStream> {
             let (router_side, worker_side) = std::os::unix::net::UnixStream::pair()?;
             router_side.set_nonblocking(true)?;
             worker_side.set_nonblocking(true)?;
-            tx.send(UnixStream::from_std(worker_side)?)
+            self.tx
+                .send(UnixStream::from_std(worker_side)?)
                 .map_err(|_| anyhow::anyhow!("test dropped the stream receiver"))?;
             Ok(UnixStream::from_std(router_side)?)
-        });
-        (spawner, rx)
+        }
+        fn kill(&self, token: u64) {
+            self.killed.lock().expect("killed lock").push(token);
+        }
+    }
+
+    fn test_spawner() -> (Arc<TestSpawner>, tokio::sync::mpsc::UnboundedReceiver<UnixStream>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Arc::new(TestSpawner { tx, killed: Mutex::new(Vec::new()) }), rx)
     }
 
     async fn wk_send(stream: &mut UnixStream, kind: FrameKind, id: u32, aux: u32, payload: &[u8]) {
@@ -803,6 +998,8 @@ applications:
         /// Worker end of the shared work socket.
         work: UnixDatagram,
         ack: HelloAck,
+        /// The pool's spawner: exposes the tokens it was asked to kill.
+        spawner: Arc<TestSpawner>,
         /// Kept alive: dropping it would close respawned router ends.
         _spawns: tokio::sync::mpsc::UnboundedReceiver<UnixStream>,
     }
@@ -818,7 +1015,7 @@ applications:
         let pool = Pool::start(
             "app",
             &test_app(cap),
-            spawner,
+            Arc::clone(&spawner) as Spawner,
             router_work,
             temp.to_str().unwrap(),
         )
@@ -830,6 +1027,7 @@ applications:
             pid: 0, // kill_worker ignores pid 0: no stray signals from tests
             concurrency: declare,
             capabilities,
+            token: 0,
         }
         .encode();
         wk_send(&mut stream, FrameKind::Hello, 0, 0, &hello).await;
@@ -837,7 +1035,7 @@ applications:
         assert_eq!(header.kind, FrameKind::HelloAck);
         let ack = HelloAck::decode(&payload).unwrap();
 
-        Rig { pool, stream, work, ack, _spawns: spawns }
+        Rig { pool, stream, work, ack, spawner, _spawns: spawns }
     }
 
     fn request_payload() -> Vec<u8> {
@@ -862,9 +1060,10 @@ applications:
     }
 
     #[tokio::test]
-    async fn unbounded_declaration_without_cap_grants_max() {
+    async fn unbounded_declaration_without_cap_falls_back_to_default() {
         let r = rig(None, CONCURRENCY_UNBOUNDED, 0).await;
-        assert_eq!(r.ack.concurrency, u32::MAX);
+        // Never truly unbounded: a finite default so reaping has a bound.
+        assert_eq!(r.ack.concurrency, DEFAULT_CONCURRENCY_CAP);
         assert!(!r.pool.streams_body());
         assert!(!r.pool.supports_websocket());
     }
@@ -904,6 +1103,170 @@ applications:
                 Some(WorkerEvent::End)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn flush_frame_surfaces_as_flush_event() {
+        let mut r = rig(Some(1), 1, 0).await;
+        let mut rs = r
+            .pool
+            .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+            .await
+            .unwrap();
+        let id = wk_recv_work(&r.work).await.request_id;
+
+        wk_send(&mut r.stream, FrameKind::Claim, id, 0, &[]).await;
+        wk_send(&mut r.stream, FrameKind::ResponseHeaders, id, 200, b"").await;
+        wk_send(&mut r.stream, FrameKind::Flush, id, 0, &[]).await;
+        wk_send(&mut r.stream, FrameKind::ResponseBody, id, 0, b"tick").await;
+        wk_send(&mut r.stream, FrameKind::End, id, 0, &[]).await;
+
+        assert!(matches!(
+            timeout(TICK, rs.next_event()).await.unwrap(),
+            Some(WorkerEvent::Headers { status: 200, .. })
+        ));
+        assert!(matches!(
+            timeout(TICK, rs.next_event()).await.unwrap(),
+            Some(WorkerEvent::Flush)
+        ));
+        match timeout(TICK, rs.next_event()).await.unwrap() {
+            Some(WorkerEvent::Chunk(c)) => assert_eq!(c, b"tick"),
+            _ => panic!("expected chunk"),
+        }
+        assert!(matches!(timeout(TICK, rs.next_event()).await.unwrap(), Some(WorkerEvent::End)));
+    }
+
+    #[tokio::test]
+    async fn end_releases_client_but_done_frees_the_slot() {
+        let mut r = rig(Some(1), 1, 0).await;
+        let mut rs = r
+            .pool
+            .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+            .await
+            .unwrap();
+        let id = wk_recv_work(&r.work).await.request_id;
+
+        wk_send(&mut r.stream, FrameKind::Claim, id, 0, &[]).await;
+        wk_send(&mut r.stream, FrameKind::ResponseHeaders, id, 200, b"").await;
+        wk_send(&mut r.stream, FrameKind::End, id, 0, &[]).await;
+
+        assert!(matches!(
+            timeout(TICK, rs.next_event()).await.unwrap(),
+            Some(WorkerEvent::Headers { .. })
+        ));
+        assert!(matches!(timeout(TICK, rs.next_event()).await.unwrap(), Some(WorkerEvent::End)));
+
+        // Client response is done, but the task still holds its slot (a
+        // finish_request background task would still be running).
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(r.pool.stats().idle, 0, "slot held until Done");
+
+        // Done frees the slot.
+        wk_send(&mut r.stream, FrameKind::Done, id, 0, &[]).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(r.pool.stats().idle, 1, "slot freed on Done");
+    }
+
+    #[tokio::test]
+    async fn sweep_aborts_over_budget_task_then_kills_if_defiant() {
+        let mut r = rig(Some(1), 1, 0).await;
+        let _rs = r
+            .pool
+            .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+            .await
+            .unwrap();
+        let id = wk_recv_work(&r.work).await.request_id;
+        wk_send(&mut r.stream, FrameKind::Claim, id, 0, &[]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await; // reader records the claim
+
+        // Pin claimed_at to a known base so the wall-clock is under our control.
+        let base = Instant::now();
+        r.pool.pending.lock().unwrap().get_mut(&id).unwrap().claimed_at = Some(base);
+
+        // Over budget: the task gets one Abort, no kill candidate yet.
+        let t1 = base + r.pool.task_timeout + Duration::from_secs(1);
+        let (to_abort, candidates) = r.pool.sweep_decide(t1, Duration::from_millis(100));
+        assert_eq!(to_abort, vec![id]);
+        assert!(candidates.is_empty());
+
+        // Still alive after the grace: the (blocking) worker becomes a kill
+        // candidate (the final kill is gated by a Ping in the async sweep).
+        let t2 = t1 + Duration::from_millis(200);
+        let (to_abort2, candidates2) = r.pool.sweep_decide(t2, Duration::from_millis(100));
+        assert!(to_abort2.is_empty(), "already aborted once");
+        assert_eq!(candidates2.len(), 1, "one defiant slot = 100% for a blocking worker");
+        assert_eq!(candidates2[0].token, 0);
+        assert_eq!(candidates2[0].probe_task, id);
+    }
+
+    #[tokio::test]
+    async fn confirm_and_kill_kills_a_busy_defiant_worker() {
+        let mut r = rig(Some(1), 1, 0).await;
+        let candidates = vec![KillCandidate { worker_id: 0, token: 7, probe_task: 42 }];
+        let pool = Arc::clone(&r.pool);
+        let job =
+            tokio::spawn(async move { pool.confirm_and_kill(candidates, Duration::from_secs(2)).await });
+
+        let (ping, _) = wk_recv(&mut r.stream).await;
+        assert_eq!((ping.kind, ping.request_id), (FrameKind::Ping, 42));
+        wk_send(&mut r.stream, FrameKind::Pong, 42, PONG_BUSY, &[]).await;
+
+        job.await.unwrap();
+        assert_eq!(*r.spawner.killed.lock().unwrap(), vec![7], "busy defiant worker killed by token");
+    }
+
+    #[tokio::test]
+    async fn confirm_and_kill_spares_an_idle_worker() {
+        let mut r = rig(Some(1), 1, 0).await;
+        let candidates = vec![KillCandidate { worker_id: 0, token: 7, probe_task: 42 }];
+        let pool = Arc::clone(&r.pool);
+        let job =
+            tokio::spawn(async move { pool.confirm_and_kill(candidates, Duration::from_secs(2)).await });
+
+        let (ping, _) = wk_recv(&mut r.stream).await;
+        assert_eq!(ping.kind, FrameKind::Ping);
+        // Pong: idle -> the task actually finished (reader lagged): don't kill.
+        wk_send(&mut r.stream, FrameKind::Pong, 42, PONG_IDLE, &[]).await;
+
+        job.await.unwrap();
+        assert!(r.spawner.killed.lock().unwrap().is_empty(), "idle worker must be spared");
+    }
+
+    #[tokio::test]
+    async fn probe_pings_and_reader_completes_it_with_status() {
+        let mut r = rig(Some(1), 1, 0).await;
+        // The rig's single worker got id 0.
+        let pool = Arc::clone(&r.pool);
+        let probe = tokio::spawn(async move { pool.probe(0, 42, Duration::from_secs(2)).await });
+
+        // Worker side: receive the Ping, answer Pong: busy.
+        let (ping, _) = wk_recv(&mut r.stream).await;
+        assert_eq!((ping.kind, ping.request_id), (FrameKind::Ping, 42));
+        wk_send(&mut r.stream, FrameKind::Pong, 42, PONG_BUSY, &[]).await;
+
+        let status = timeout(TICK, probe).await.unwrap().unwrap();
+        assert_eq!(status, Some(PONG_BUSY));
+    }
+
+    #[tokio::test]
+    async fn send_abort_reaches_the_claiming_worker() {
+        let mut r = rig(Some(1), 1, 0).await;
+        let rs = r
+            .pool
+            .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+            .await
+            .unwrap();
+        let id = wk_recv_work(&r.work).await.request_id;
+
+        wk_send(&mut r.stream, FrameKind::Claim, id, 0, &[]).await;
+        // Let the reader task record claimed_by before we abort.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        rs.send_abort().await;
+
+        let (header, _) = wk_recv(&mut r.stream).await;
+        assert_eq!(header.kind, FrameKind::Abort);
+        assert_eq!(header.request_id, id);
     }
 
     #[tokio::test]
