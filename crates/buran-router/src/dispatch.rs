@@ -182,6 +182,9 @@ impl Pool {
         let work = UnixDatagram::from_std(work)?;
 
         std::fs::create_dir_all(body_temp_path)?;
+        // Sweep spill files orphaned by a previous instance that was killed
+        // before its worker could unlink them (Drop never ran).
+        cleanup_stale_spills(std::path::Path::new(body_temp_path));
 
         let pool = Arc::new(Pool {
             work,
@@ -217,6 +220,13 @@ impl Pool {
     /// Where oversized request bodies spill (FLAG_BODY_FILE).
     pub fn body_temp(&self) -> &std::path::Path {
         &self.body_temp_path
+    }
+
+    /// The spill filename for a given sequence number: `body-<pid>-<seq>`.
+    /// The pid lets startup cleanup tell a dead instance's leftovers from a
+    /// co-running one sharing the same temp directory.
+    pub fn spill_path(&self, seq: u64) -> std::path::PathBuf {
+        self.body_temp_path.join(format!("body-{}-{}", std::process::id(), seq))
     }
 
     /// Whether this pool's workers accept streamed request bodies. False
@@ -274,18 +284,22 @@ impl Pool {
         u64::from(self.metrics.active.load(Ordering::Relaxed)) * self.worker_concurrency()
     }
 
-    /// Enqueue a request into the kernel work queue. The response arrives
-    /// as events; the returned guard cleans up on drop.
+    /// Reserve a queue slot up front, before the caller does any expensive
+    /// per-request setup (e.g. spilling a large body to disk). A full queue
+    /// fails here (spec 2.9), so nothing hits the disk just to be rejected.
+    pub fn try_reserve(self: &Arc<Self>) -> Result<QueuePermit, DispatchError> {
+        Arc::clone(&self.queue).try_acquire_owned().map_err(|_| DispatchError::QueueFull)
+    }
+
+    /// Enqueue a request into the kernel work queue under a slot already
+    /// reserved by [`try_reserve`]. The response arrives as events; the
+    /// returned guard cleans up on drop.
     pub async fn submit(
         self: &Arc<Self>,
+        permit: QueuePermit,
         payload: Vec<u8>,
         body: SubmitBody,
     ) -> Result<ResponseStream, DispatchError> {
-        // Full queue -> fail fast, no waiting (spec 2.9).
-        let permit = Arc::clone(&self.queue)
-            .try_acquire_owned()
-            .map_err(|_| DispatchError::QueueFull)?;
-
         let mut fh = FrameHeader::new(FrameKind::Request, 0, payload.len() as u32);
         let body_rx = match body {
             SubmitBody::Inline => None,
@@ -622,11 +636,14 @@ async fn janitor(pool: Arc<Pool>, idle_exit: Duration) {
 
 /// Response stream for one submitted request. Dropping it abandons the
 /// request: late frames are discarded by the reader task.
+/// A reserved queue slot, held for the request's lifetime.
+pub type QueuePermit = tokio::sync::OwnedSemaphorePermit;
+
 pub struct ResponseStream {
     pool: Arc<Pool>,
     id: u32,
     rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: QueuePermit,
 }
 
 impl ResponseStream {
@@ -673,6 +690,33 @@ impl Drop for ResponseStream {
         // and client disconnects.
         self.pool.remove_pending(self.id);
     }
+}
+
+/// Remove `body-<pid>-*` spill files whose owning process is gone. Files of
+/// a still-live pid (a co-running buran sharing the temp dir) are left alone.
+fn cleanup_stale_spills(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("body-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if !pid_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// `kill(pid, 0)` liveness probe: ESRCH means the process is gone; any other
+/// result (including EPERM) means it still exists.
+fn pid_alive(pid: i32) -> bool {
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else { return false };
+    !matches!(rustix::process::test_kill_process(pid), Err(rustix::io::Errno::SRCH))
 }
 
 async fn read_frame(stream: &mut BufReader<OwnedReadHalf>) -> std::io::Result<(FrameHeader, Vec<u8>)> {
@@ -824,9 +868,9 @@ applications:
         let mut r = rig(Some(4), 4, 0).await;
 
         let mut first =
-            r.pool.submit(request_payload(), SubmitBody::Inline).await.unwrap();
+            r.pool.submit(r.pool.try_reserve().unwrap(), request_payload(),SubmitBody::Inline).await.unwrap();
         let mut second =
-            r.pool.submit(request_payload(), SubmitBody::Inline).await.unwrap();
+            r.pool.submit(r.pool.try_reserve().unwrap(), request_payload(),SubmitBody::Inline).await.unwrap();
         let id1 = wk_recv_work(&r.work).await.request_id;
         let id2 = wk_recv_work(&r.work).await.request_id;
 
@@ -861,9 +905,9 @@ applications:
         let mut r = rig(Some(4), 4, 0).await;
 
         let mut first =
-            r.pool.submit(request_payload(), SubmitBody::Inline).await.unwrap();
+            r.pool.submit(r.pool.try_reserve().unwrap(), request_payload(),SubmitBody::Inline).await.unwrap();
         let mut second =
-            r.pool.submit(request_payload(), SubmitBody::Inline).await.unwrap();
+            r.pool.submit(r.pool.try_reserve().unwrap(), request_payload(),SubmitBody::Inline).await.unwrap();
         let id1 = wk_recv_work(&r.work).await.request_id;
         let id2 = wk_recv_work(&r.work).await.request_id;
 
@@ -889,7 +933,7 @@ applications:
         let mut r = rig(None, 4, CAP_BODY_STREAM).await;
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let _rs = r.pool.submit(request_payload(), SubmitBody::Stream(rx)).await.unwrap();
+        let _rs = r.pool.submit(r.pool.try_reserve().unwrap(), request_payload(),SubmitBody::Stream(rx)).await.unwrap();
         let header = wk_recv_work(&r.work).await;
         assert_ne!(header.flags & FLAG_BODY_STREAM, 0, "stream flag must be set");
 
@@ -915,7 +959,7 @@ applications:
     async fn ws_messages_flow_both_ways() {
         let mut r = rig(None, 4, CAP_WEBSOCKET).await;
 
-        let mut rs = r.pool.submit(request_payload(), SubmitBody::Upgrade).await.unwrap();
+        let mut rs = r.pool.submit(r.pool.try_reserve().unwrap(), request_payload(),SubmitBody::Upgrade).await.unwrap();
         let header = wk_recv_work(&r.work).await;
         assert_ne!(header.flags & FLAG_UPGRADE, 0, "upgrade flag must be set");
         let id = header.request_id;

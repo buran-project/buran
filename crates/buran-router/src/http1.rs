@@ -575,6 +575,20 @@ enum AppRes {
     Upgraded(ResponseStream, Vec<u8>),
 }
 
+/// Unlinks a spilled request-body temp file on drop. The claiming worker
+/// unlinks it right after opening (happy path -> this is a no-op ENOENT);
+/// the guard is the safety net for queue rejection, worker death or a lost
+/// datagram, where no worker ever opens the file.
+struct SpillGuard(Option<std::path::PathBuf>);
+
+impl Drop for SpillGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
     wr: &mut W,
@@ -617,8 +631,19 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         builder.field(name, value);
     }
 
+    // Reserve a queue slot before any per-request setup: a full queue must
+    // reject with 503 before a large body is ever written to disk.
+    let permit = match pool.try_reserve() {
+        Ok(p) => p,
+        Err(_) => {
+            write_simple(wr, 503, "Service Unavailable", keep_alive).await?;
+            return Ok(AppRes::Http(503, None));
+        }
+    };
+
     let mut submit_body = SubmitBody::Inline;
     let mut feed: Option<tokio::task::JoinHandle<(OwnedReadHalf, bool)>> = None;
+    let mut spill_path: Option<std::path::PathBuf> = None;
     match body {
         BodyPlan::Buffered(bytes) => {
             builder.content_length(bytes.len() as u64);
@@ -628,16 +653,13 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
                 static SPILL_SEQ: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let seq = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let spill = pool
-                    .body_temp()
-                    .join(format!("body-{}-{}", std::process::id(), seq))
-                    .to_string_lossy()
-                    .into_owned();
+                let spill = pool.spill_path(seq);
                 if tokio::fs::write(&spill, bytes).await.is_err() {
                     write_simple(wr, 500, "Internal Server Error", keep_alive).await?;
                     return Ok(AppRes::Http(500, None));
                 }
-                builder.preread_body(spill.as_bytes());
+                builder.preread_body(spill.to_string_lossy().as_bytes());
+                spill_path = Some(spill);
                 submit_body = SubmitBody::File;
             } else {
                 builder.preread_body(bytes);
@@ -663,11 +685,14 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         // Upgrade offers carry no body by construction (GET, length 0).
         submit_body = SubmitBody::Upgrade;
     }
+    // Held until the response is fully handled: unlinks the spilled body if
+    // no worker ever consumed it (queue reject, worker death, lost datagram).
+    let _spill_guard = SpillGuard(spill_path);
     let payload = builder.finish();
 
     // Submit into the kernel work queue; any worker with a free slot picks
     // it up directly, the router is out of the pickup path (spec 2.9).
-    let mut worker = match pool.submit(payload, submit_body).await {
+    let mut worker = match pool.submit(permit, payload, submit_body).await {
         Ok(w) => w,
         Err(DispatchError::WorkerFailed) => {
             abort_feed(&feed);
