@@ -172,6 +172,10 @@ pub struct Pool {
     metrics: Metrics,
     worker_seq: AtomicU32,
     body_temp_path: std::path::PathBuf,
+    /// uid the workers drop to, if any: spilled request bodies are created
+    /// 0600 and chowned to it so a worker under a different user can open
+    /// them without the file being world-readable.
+    body_owner: Option<u32>,
     /// applications.<name>.concurrency (u32::MAX = no cap).
     concurrency_cap: u32,
     /// Concurrency granted to this pool's workers, set at first handshake
@@ -198,6 +202,7 @@ impl Pool {
         spawner: Spawner,
         work: std::os::unix::net::UnixDatagram,
         body_temp_path: &str,
+        body_owner: Option<u32>,
     ) -> anyhow::Result<Arc<Pool>> {
         let (initial, max, spare, idle_exit) = match app.processes {
             Processes::Fixed(n) => (n, n, n, None),
@@ -231,6 +236,7 @@ impl Pool {
             metrics: Metrics { active: AtomicU32::new(0), in_flight: AtomicU32::new(0) },
             worker_seq: AtomicU32::new(0),
             body_temp_path: std::path::PathBuf::from(body_temp_path),
+            body_owner,
             concurrency_cap: app.concurrency.unwrap_or(u32::MAX),
             granted: AtomicU32::new(0),
             caps: AtomicU32::new(0),
@@ -259,6 +265,32 @@ impl Pool {
     /// co-running one sharing the same temp directory.
     pub fn spill_path(&self, seq: u64) -> std::path::PathBuf {
         self.body_temp_path.join(format!("body-{}-{}", std::process::id(), seq))
+    }
+
+    /// Write an oversized request body to `path`, created 0600 so it is never
+    /// world/group-readable (bodies carry uploads, tokens, passwords). When
+    /// the workers drop to a uid, the file is chowned to it so a worker under
+    /// a different user can still open it (0600 alone would deny it).
+    pub async fn write_spill(&self, path: &std::path::PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+        if let Some(uid) = self.body_owner {
+            // fchown by the open handle: no path race, and it only succeeds
+            // while buran runs as root (the privilege-drop precondition for a
+            // configured worker uid), which is exactly when it is needed.
+            let std_file = file.try_clone().await?.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                std::os::unix::fs::fchown(&std_file, Some(uid), None)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+        }
+        file.write_all(bytes).await?;
+        file.flush().await
     }
 
     /// Whether this pool's workers accept streamed request bodies. False
@@ -898,14 +930,27 @@ fn pid_alive(pid: i32) -> bool {
     !matches!(rustix::process::test_kill_process(pid), Err(rustix::io::Errno::SRCH))
 }
 
+/// Hard ceiling on a single response-stream frame payload. Legitimate frames
+/// are far smaller (the blocking SDK drains at 256 KiB, PHP `ub_write` chunks
+/// smaller still); this only stops a buggy/hostile worker from making the
+/// router buffer up to 4 GiB from one framed length. Over it, the stream is
+/// failed and the worker's requests fall out with the reader.
+const MAX_FRAME_PAYLOAD: u32 = 64 * 1024 * 1024;
+
 async fn read_frame(stream: &mut BufReader<OwnedReadHalf>) -> std::io::Result<(FrameHeader, Vec<u8>)> {
     let mut head = [0u8; FRAME_HEADER_LEN];
     stream.read_exact(&mut head).await?;
     let header = FrameHeader::decode(&head)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if header.payload_len > MAX_FRAME_PAYLOAD {
+        return Err(std::io::Error::other(format!(
+            "worker frame payload {} exceeds the {MAX_FRAME_PAYLOAD}-byte limit",
+            header.payload_len
+        )));
+    }
     // Grow the buffer as bytes actually arrive rather than pre-allocating the
-    // worker-declared length: a bogus payload_len (buggy worker, up to 4 GiB)
-    // then hits EOF instead of committing gigabytes of zeroed memory.
+    // worker-declared length: a bogus payload_len (buggy worker) then hits EOF
+    // instead of committing the whole capped size of zeroed memory.
     let want = u64::from(header.payload_len);
     let mut payload = Vec::new();
     if stream.take(want).read_to_end(&mut payload).await? as u64 != want {
@@ -1015,6 +1060,7 @@ applications:
             Arc::clone(&spawner) as Spawner,
             router_work,
             temp.to_str().unwrap(),
+            None,
         )
         .unwrap();
 
@@ -1357,5 +1403,56 @@ applications:
         // End releases the slot like any other request.
         wk_send(&mut r.stream, FrameKind::End, id, 0, &[]).await;
         assert!(matches!(timeout(TICK, rs.next_event()).await.unwrap(), Some(WorkerEvent::End)));
+    }
+
+    #[tokio::test]
+    async fn write_spill_creates_file_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        // Bodies carry uploads/tokens: the spill must not be world/group
+        // readable. (body_owner is None here, so no chown is attempted — the
+        // mode is the whole protection when workers share buran's uid.)
+        let r = rig(Some(1), 1, 0).await;
+        let path = r.pool.spill_path(9_876_543);
+        let _ = std::fs::remove_file(&path); // clear any leftover from a prior run
+
+        r.pool.write_spill(&path, b"secret-body").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "spill file must be 0600");
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret-body");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_payload_len() {
+        // A worker declaring a payload past the cap must be refused before the
+        // router buffers it — the header alone (no payload bytes follow) is
+        // enough to trip the guard.
+        let (worker, router) = UnixStream::pair().unwrap();
+        let mut worker = worker;
+        let header = FrameHeader::new(FrameKind::ResponseBody, 1, MAX_FRAME_PAYLOAD + 1);
+        worker.write_all(&header.encode()).await.unwrap();
+
+        let mut reader = BufReader::new(router.into_split().0);
+        let err = read_frame(&mut reader).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_frame_accepts_payload_at_the_cap_boundary() {
+        // A frame exactly at the limit is fine (an empty body sized to the cap
+        // would block on real bytes, so use a small payload with a legal len).
+        let (worker, router) = UnixStream::pair().unwrap();
+        let mut worker = worker;
+        let body = b"ok";
+        let header = FrameKind::ResponseBody;
+        let fh = FrameHeader::new(header, 9, body.len() as u32);
+        let mut buf = fh.encode().to_vec();
+        buf.extend_from_slice(body);
+        worker.write_all(&buf).await.unwrap();
+
+        let mut reader = BufReader::new(router.into_split().0);
+        let (h, payload) = read_frame(&mut reader).await.unwrap();
+        assert_eq!(h.request_id, 9);
+        assert_eq!(payload, body);
     }
 }

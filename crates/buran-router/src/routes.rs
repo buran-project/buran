@@ -309,10 +309,19 @@ impl Step {
                 return false;
             }
         if let Some(set) = &m.host {
-            // Host header may carry a port: match on the name part.
-            let host = match memchr::memchr(b':', meta.host) {
-                Some(pos) => &meta.host[..pos],
-                None => meta.host,
+            // Host header may carry a port: match on the name part. A bracketed
+            // IPv6 literal (`[::1]:8080`) keeps its colons inside the brackets,
+            // so strip the port after `]`; otherwise split on the first colon.
+            let host = if meta.host.first() == Some(&b'[') {
+                match memchr::memchr(b']', meta.host) {
+                    Some(pos) => &meta.host[..=pos],
+                    None => meta.host,
+                }
+            } else {
+                match memchr::memchr(b':', meta.host) {
+                    Some(pos) => &meta.host[..pos],
+                    None => meta.host,
+                }
             };
             if !set.matches(host, true) {
                 return false;
@@ -389,9 +398,13 @@ mod tests {
     }
 
     fn meta<'a>(path: &'a [u8], query: &'a [u8]) -> RequestMeta<'a> {
+        meta_host(b"example.test", path, query)
+    }
+
+    fn meta_host<'a>(host: &'a [u8], path: &'a [u8], query: &'a [u8]) -> RequestMeta<'a> {
         RequestMeta {
             method: b"GET",
-            host: b"example.test",
+            host,
             path,
             query,
             headers: &[],
@@ -550,6 +563,56 @@ routes:
         );
         // Self-jump must terminate via the hop limit, not spin forever.
         assert!(matches!(routes.decide("main", &meta(b"/x", b"")).decision, Decision::NotFound));
+    }
+
+    #[test]
+    fn host_matcher_strips_port() {
+        let routes = compiled(
+            "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - match: { host: \"example.test\" }
+      action: { return: 200 }
+    - action: { return: 404 }
+",
+        );
+        let hit = |host: &[u8]| {
+            matches!(
+                routes.decide("main", &meta_host(host, b"/", b"")).decision,
+                Decision::Return { status: 200, .. }
+            )
+        };
+        assert!(hit(b"example.test"));
+        assert!(hit(b"example.test:8080"), "a port must not defeat the host match");
+        assert!(!hit(b"other.test:8080"));
+    }
+
+    #[test]
+    fn host_matcher_handles_bracketed_ipv6() {
+        // The port sits after `]`, so an IPv6 authority must match on the
+        // bracketed literal, not get truncated at the first inner colon.
+        let routes = compiled(
+            "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - match: { host: \"[::1]\" }
+      action: { return: 200 }
+    - action: { return: 404 }
+",
+        );
+        let hit = |host: &[u8]| {
+            matches!(
+                routes.decide("main", &meta_host(host, b"/", b"")).decision,
+                Decision::Return { status: 200, .. }
+            )
+        };
+        assert!(hit(b"[::1]"));
+        assert!(hit(b"[::1]:8080"), "the port after ] must be stripped");
+        assert!(!hit(b"[::2]:8080"));
     }
 
     #[test]

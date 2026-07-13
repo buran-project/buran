@@ -31,6 +31,10 @@ pub struct AppConfig {
     pub user_id: Option<u32>,
     #[serde(default)]
     pub group_id: Option<u32>,
+    /// User name, kept alongside `user_id` so the prototype can call
+    /// initgroups (install the user's own supplementary groups) on drop.
+    #[serde(default)]
+    pub user_name: Option<String>,
 }
 
 fn main() -> ExitCode {

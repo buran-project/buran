@@ -208,17 +208,13 @@ impl PrototypeSpawner {
             cmd.current_dir(dir);
         }
 
-        // Safety: dup2 is async-signal-safe; it clears CLOEXEC on the
-        // target fds so the child inherits exactly the control channel and
-        // the shared work socket.
+        // Safety: dup2/fcntl are async-signal-safe; `install_fd` moves each
+        // inherited fd to its well-known number and clears CLOEXEC so the
+        // child keeps exactly the control channel and the shared work socket.
         unsafe {
             cmd.pre_exec(move || {
-                if libc_dup2(theirs_fd, CONTROL_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc_dup2(work_fd, WORK_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                install_fd(theirs_fd, CONTROL_FD)?;
+                install_fd(work_fd, WORK_FD)?;
                 Ok(())
             });
         }
@@ -296,14 +292,17 @@ fn send_kill(control: &StdUnixStream, token: u64) -> std::io::Result<()> {
     (&mut &*control).write_all(&msg)
 }
 
-/// Returns the spawner plus the router end of the shared work socket
-/// (the kernel-arbitrated request queue of this application).
+/// Returns the spawner, the router end of the shared work socket (the
+/// kernel-arbitrated request queue of this application), and the uid the
+/// workers drop to (if any) — the router chowns spilled request bodies to it
+/// so a worker under a different user can still open them.
 pub fn make_spawner(
     app_name: &str,
     module_binary: PathBuf,
     app: &Application,
-) -> anyhow::Result<(Spawner, UnixDatagram)> {
+) -> anyhow::Result<(Spawner, UnixDatagram, Option<u32>)> {
     let ids = resolve_ids(app).with_context(|| format!("application {app_name}"))?;
+    let worker_uid = ids.uid;
 
     let (router_end, worker_end) = UnixDatagram::pair().context("work socketpair")?;
 
@@ -316,7 +315,22 @@ pub fn make_spawner(
         working_dir: app.working_directory.as_ref().map(PathBuf::from),
         work_worker_end: OwnedFd::from(worker_end),
     });
-    Ok((spawner, router_end))
+    Ok((spawner, router_end, worker_uid))
+}
+
+/// Move `old` onto the well-known `new` fd for the child, CLOEXEC cleared.
+/// Async-signal-safe (only dup2/fcntl). When `old == new`, `dup2` is a no-op
+/// that does NOT clear CLOEXEC, so the fd would close on exec — clear it
+/// explicitly instead.
+fn install_fd(old: i32, new: i32) -> std::io::Result<()> {
+    if old == new {
+        if libc_fcntl_setfd(new, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else if libc_dup2(old, new) < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn libc_dup2(old: i32, new: i32) -> i32 {
@@ -324,6 +338,15 @@ fn libc_dup2(old: i32, new: i32) -> i32 {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
     unsafe { dup2(old, new) }
+}
+
+/// `fcntl(fd, F_SETFD, flags)`; used to clear FD_CLOEXEC (flags 0).
+fn libc_fcntl_setfd(fd: i32, flags: i32) -> i32 {
+    const F_SETFD: i32 = 2;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    unsafe { fcntl(fd, F_SETFD, flags) }
 }
 
 fn libc_close(fd: i32) {
@@ -338,6 +361,44 @@ fn libc_close(fd: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fcntl(fd, F_GETFD)`; returns the fd flags (FD_CLOEXEC is bit 0).
+    fn fd_flags(fd: i32) -> i32 {
+        const F_GETFD: i32 = 1;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        unsafe { fcntl(fd, F_GETFD) }
+    }
+
+    const FD_CLOEXEC: i32 = 1;
+
+    #[test]
+    fn install_fd_clears_cloexec_when_fd_already_in_place() {
+        // The dup2(fd, fd) no-op would leave CLOEXEC set and the fd would close
+        // on exec — install_fd must clear it explicitly. Rust sets CLOEXEC on
+        // sockets it creates, so this is exactly the at-risk case.
+        let (a, _b) = StdUnixStream::pair().unwrap();
+        let fd = a.as_raw_fd();
+        assert_ne!(fd_flags(fd) & FD_CLOEXEC, 0, "precondition: CLOEXEC set");
+
+        install_fd(fd, fd).unwrap();
+        assert_eq!(fd_flags(fd) & FD_CLOEXEC, 0, "CLOEXEC must be cleared");
+    }
+
+    #[test]
+    fn install_fd_moves_fd_and_clears_cloexec() {
+        // old != new: dup2 replaces `new` with a CLOEXEC-free dup of `old`.
+        let (src, _s) = StdUnixStream::pair().unwrap();
+        let (dst, _d) = StdUnixStream::pair().unwrap();
+        let (old, new) = (src.as_raw_fd(), dst.as_raw_fd());
+        assert_ne!(old, new);
+
+        install_fd(old, new).unwrap();
+        // `new` now aliases src's description with CLOEXEC cleared; `dst` still
+        // owns the number and closes it on drop.
+        assert_eq!(fd_flags(new) & FD_CLOEXEC, 0, "CLOEXEC must be cleared on the target");
+    }
 
     fn scalar(yaml: &str) -> serde_norway::Value {
         serde_norway::from_str(yaml).unwrap()

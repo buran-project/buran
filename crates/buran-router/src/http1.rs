@@ -669,7 +669,7 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
                     std::sync::atomic::AtomicU64::new(0);
                 let seq = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let spill = pool.spill_path(seq);
-                if tokio::fs::write(&spill, bytes).await.is_err() {
+                if pool.write_spill(&spill, bytes).await.is_err() {
                     write_simple(wr, 500, "Internal Server Error", keep_alive).await?;
                     return Ok(AppRes::Http(500, None));
                 }

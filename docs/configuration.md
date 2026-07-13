@@ -88,7 +88,11 @@ Notes:
   file** under `body_temp_path`, and the worker receives the file path instead
   of the bytes — so `body_temp_path` must be writable and ideally on fast local
   storage (e.g. tmpfs). Streaming-capable runtimes receive large bodies as a
-  frame stream rather than a file.
+  frame stream rather than a file. Spill files are created with mode `0600`
+  (request bodies may carry uploads, tokens or passwords, so they are never
+  world- or group-readable); when an application sets `user`, Buran chowns each
+  spill file to that uid so the worker can still open it. Use a directory only
+  Buran and its workers can reach.
 - **`static.mime_types`** extends, never replaces, the built-in MIME table
   (see [Static files](static-files.md)).
 - **WebSocket** connections live outside the regular HTTP budgets: the request

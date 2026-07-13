@@ -54,7 +54,7 @@ impl Router {
     /// a process-spawning closure per application (owned by the supervisor).
     pub fn new(
         validated: &Validated,
-        mut spawners: BTreeMap<String, (Spawner, std::os::unix::net::UnixDatagram)>,
+        mut spawners: BTreeMap<String, (Spawner, std::os::unix::net::UnixDatagram, Option<u32>)>,
         source_exts: std::collections::BTreeSet<String>,
     ) -> anyhow::Result<Self> {
         let routes = routes::compile(validated)?;
@@ -62,12 +62,12 @@ impl Router {
         let body_temp = validated.config.settings.http.body_temp_path.clone();
         let mut pools = BTreeMap::new();
         for (name, app) in &validated.applications {
-            let (spawner, work) = spawners
+            let (spawner, work, body_owner) = spawners
                 .remove(name)
                 .with_context(|| format!("no spawner for application {name}"))?;
             pools.insert(
                 name.clone(),
-                Pool::start(name, app, spawner, work, &body_temp)
+                Pool::start(name, app, spawner, work, &body_temp, body_owner)
                     .with_context(|| format!("cannot start pool for {name}"))?,
             );
         }

@@ -424,6 +424,13 @@ fn build_server_vars(
             content_type_seen = true;
             continue;
         }
+        // Drop headers whose name carries an underscore: `-` maps to `_` when
+        // building the HTTP_ variable, so `X_Forwarded_For` would collide with
+        // `X-Forwarded-For` and let a client spoof a proxy-set header. nginx
+        // does the same by default (`underscores_in_headers off`).
+        if field.name.contains(&b'_') {
+            continue;
+        }
         let mut name = String::with_capacity(5 + field.name.len());
         name.push_str("HTTP_");
         for &b in field.name {
@@ -597,4 +604,83 @@ pub extern "C" fn buran_cb_finish_request() {
 pub extern "C" fn buran_cb_log(message: *const c_char) {
     let msg = unsafe { std::ffi::CStr::from_ptr(message) };
     eprintln!("php: {}", msg.to_string_lossy());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buran_ipc::RequestBuilder;
+    use std::collections::HashMap;
+
+    /// Rebuild a name -> value map from the `$_SERVER` arena + entry table.
+    fn vars_map(arena: &[u8], entries: &[VarEntry]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|&(name_off, value_off, value_len)| {
+                let name_end =
+                    name_off + arena[name_off..].iter().position(|&b| b == 0).unwrap();
+                let name = String::from_utf8_lossy(&arena[name_off..name_end]).into_owned();
+                let value =
+                    String::from_utf8_lossy(&arena[value_off..value_off + value_len]).into_owned();
+                (name, value)
+            })
+            .collect()
+    }
+
+    fn app() -> AppConfig {
+        serde_json::from_str(r#"{"root":"/www"}"#).unwrap()
+    }
+
+    fn script() -> ResolvedScript {
+        ResolvedScript {
+            filename: "/www/index.php".to_string(),
+            script_name: "/index.php".to_string(),
+            path_info: None,
+        }
+    }
+
+    #[test]
+    fn underscore_headers_are_dropped_to_prevent_spoofing() {
+        // A client-sent `X_Forwarded_For` maps to the same HTTP_ var as a
+        // proxy's `X-Forwarded-For`; dropping the underscore form stops the
+        // spoof (nginx `underscores_in_headers off` parity).
+        let payload = RequestBuilder::new()
+            .method(b"GET")
+            .path(b"/index.php")
+            .target(b"/index.php")
+            .query(b"")
+            .version(b"HTTP/1.1")
+            .remote_addr(b"127.0.0.1")
+            .server_name(b"h")
+            .field(b"x-forwarded-for", b"1.1.1.1")
+            .field(b"x_forwarded_for", b"2.2.2.2")
+            .preread_body(b"")
+            .finish();
+        let view = RequestView::parse(&payload).unwrap();
+        let (arena, entries) = build_server_vars(&view, &app(), &script()).unwrap();
+        let map = vars_map(&arena, &entries);
+
+        assert_eq!(map.get("HTTP_X_FORWARDED_FOR").map(String::as_str), Some("1.1.1.1"));
+        // The spoofed underscore value must not survive under any key.
+        assert!(!map.values().any(|v| v == "2.2.2.2"), "underscore header leaked: {map:?}");
+    }
+
+    #[test]
+    fn ordinary_headers_still_become_http_vars() {
+        let payload = RequestBuilder::new()
+            .method(b"GET")
+            .path(b"/index.php")
+            .target(b"/index.php")
+            .query(b"")
+            .version(b"HTTP/1.1")
+            .remote_addr(b"127.0.0.1")
+            .server_name(b"h")
+            .field(b"accept-encoding", b"gzip")
+            .preread_body(b"")
+            .finish();
+        let view = RequestView::parse(&payload).unwrap();
+        let (arena, entries) = build_server_vars(&view, &app(), &script()).unwrap();
+        let map = vars_map(&arena, &entries);
+        assert_eq!(map.get("HTTP_ACCEPT_ENCODING").map(String::as_str), Some("gzip"));
+    }
 }

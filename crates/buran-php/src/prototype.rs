@@ -88,6 +88,13 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
     loop {
         reap_children(&mut workers);
 
+        // Wait up to a second for a command; the timeout wakes us to reap
+        // workers that exited on their own (Retire / max_requests) instead of
+        // leaving them as zombies until the next command arrives.
+        if !wait_readable(&control) {
+            continue;
+        }
+
         let worker_fd = match recv_command(&control) {
             Ok(Some(Command::Spawn(fd))) => fd,
             Ok(Some(Command::Kill(token))) => {
@@ -124,6 +131,21 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
                 drop(worker_fd);
             }
         }
+    }
+}
+
+/// Poll the control channel for up to a second. `true` = readable (a command
+/// or EOF is waiting, `recv_command` will not block); `false` = the timeout
+/// elapsed, so the loop just reaps and waits again. A poll error is treated as
+/// readable so the recv path surfaces it.
+fn wait_readable(control: &UnixStream) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::AsFd;
+
+    let mut fds = [PollFd::new(control.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut fds, PollTimeout::from(1000u16)) {
+        Ok(0) => false, // timeout: nothing to receive, go reap
+        _ => true,      // readable, or an error to surface via recv_command
     }
 }
 

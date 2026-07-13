@@ -38,13 +38,36 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
     let control = unsafe { UnixStream::from_raw_fd(control_fd) };
     let work = unsafe { UnixDatagram::from_raw_fd(work_fd) };
 
-    // Privilege drop; group first (setuid drops the right to setgid).
-    // Workers inherit the identity via fork.
-    if let Some(gid) = app.group_id
-        && let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)) {
+    // Privilege drop before workers fork; groups first, then gid, then uid
+    // (setuid drops the right to change the others). Workers inherit the
+    // identity via fork.
+    if let Some(gid) = app.group_id {
+        let gid = nix::unistd::Gid::from_raw(gid);
+        // Reset supplementary groups before dropping. Skipping this leaves a
+        // root-started worker carrying root's supplementary groups — an
+        // incomplete privilege drop (php-fpm calls initgroups for the same
+        // reason). With the user name known, initgroups installs that user's
+        // own groups; otherwise we at least strip inherited ones down to the
+        // primary gid.
+        let groups_res = match app.user_name.as_deref() {
+            Some(name) => match std::ffi::CString::new(name) {
+                Ok(cname) => nix::unistd::initgroups(&cname, gid),
+                Err(_) => {
+                    eprintln!("buran-echo prototype: user name contains NUL");
+                    std::process::exit(1);
+                }
+            },
+            None => nix::unistd::setgroups(&[gid]),
+        };
+        if let Err(e) = groups_res {
+            eprintln!("buran-echo prototype: dropping supplementary groups failed: {e}");
+            std::process::exit(1);
+        }
+        if let Err(e) = nix::unistd::setgid(gid) {
             eprintln!("buran-echo prototype: setgid({gid}) failed: {e}");
             std::process::exit(1);
         }
+    }
     if let Some(uid) = app.user_id
         && let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)) {
             eprintln!("buran-echo prototype: setuid({uid}) failed: {e}");
@@ -57,6 +80,13 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
 
     loop {
         reap_children(&mut workers);
+
+        // Wait up to a second for a command; the timeout wakes us to reap
+        // workers that exited on their own (Retire / max_requests) instead of
+        // leaving them as zombies until the next command arrives.
+        if !wait_readable(&control) {
+            continue;
+        }
 
         let worker_fd = match recv_command(&control) {
             Ok(Some(Command::Spawn(fd))) => fd,
@@ -101,6 +131,21 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
                 drop(worker_fd);
             }
         }
+    }
+}
+
+/// Poll the control channel for up to a second. `true` = readable (a command
+/// or EOF is waiting, `recv_command` will not block); `false` = the timeout
+/// elapsed, so the loop just reaps and waits again. A poll error is treated as
+/// readable so the recv path surfaces it.
+fn wait_readable(control: &UnixStream) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::AsFd;
+
+    let mut fds = [PollFd::new(control.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut fds, PollTimeout::from(1000u16)) {
+        Ok(0) => false, // timeout: nothing to receive, go reap
+        _ => true,      // readable, or an error to surface via recv_command
     }
 }
 

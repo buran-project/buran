@@ -38,16 +38,13 @@ fn main() -> ExitCode {
         cmd.arg("--channel").arg(CHANNEL_FD.to_string());
         cmd.arg("--work").arg(WORK_FD.to_string());
         cmd.args(&extra_args);
-        // Safety: dup2 in pre_exec is async-signal-safe; it also clears
-        // CLOEXEC on the target fds so the child inherits both channels.
+        // Safety: dup2/fcntl in pre_exec are async-signal-safe; `install_fd`
+        // moves each fd to its well-known number and clears CLOEXEC so the
+        // child inherits both channels.
         unsafe {
             cmd.pre_exec(move || {
-                if libc_dup2(theirs_fd, CHANNEL_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc_dup2(work_theirs_fd, WORK_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                install_fd(theirs_fd, CHANNEL_FD)?;
+                install_fd(work_theirs_fd, WORK_FD)?;
                 Ok(())
             });
         }
@@ -175,12 +172,35 @@ fn read_frame(stream: &mut UnixStream) -> (FrameHeader, Vec<u8>) {
     (header, payload)
 }
 
+/// Move `old` onto `new` for the child, CLOEXEC cleared. Async-signal-safe.
+/// `dup2` with `old == new` is a no-op that leaves CLOEXEC set (the fd would
+/// close on exec), so clear it explicitly in that case.
+fn install_fd(old: i32, new: i32) -> std::io::Result<()> {
+    if old == new {
+        if libc_fcntl_setfd(new, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else if libc_dup2(old, new) < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn libc_dup2(old: i32, new: i32) -> i32 {
     // Minimal libc shim to avoid a direct libc dependency in this bin.
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
     unsafe { dup2(old, new) }
+}
+
+/// `fcntl(fd, F_SETFD, flags)`; clears FD_CLOEXEC with flags 0.
+fn libc_fcntl_setfd(fd: i32, flags: i32) -> i32 {
+    const F_SETFD: i32 = 2;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    unsafe { fcntl(fd, F_SETFD, flags) }
 }
 
 fn drop_fd(fd: i32) {
