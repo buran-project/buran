@@ -15,7 +15,7 @@ version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/buran-project/buran"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # A `version` is required only on deps pulled in by a *published* crate

@@ -10,7 +10,7 @@
 [![Tests](https://github.com/buran-project/buran/actions/workflows/tests.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/tests.yml)
 [![Security Scan](https://github.com/buran-project/buran/actions/workflows/scan.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/scan.yml)
 [![Release](https://github.com/buran-project/buran/actions/workflows/release.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/Rust-1.85+-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.88+-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Container](https://img.shields.io/badge/ghcr.io-buran--project%2Fburan-2496ED?logo=docker&logoColor=white)](https://github.com/buran-project/buran/pkgs/container/buran)
 [![License](https://img.shields.io/github/license/buran-project/buran)](LICENSE)
 
@@ -65,7 +65,7 @@
 
 - **Docker** — ничего, кроме среды запуска контейнеров. Официальные образы уже
   содержат Buran, PHP-модуль и opcache.
-- **Из исходников** — Rust **1.85+**. PHP-модулю дополнительно нужен `libphp`,
+- **Из исходников** — Rust **1.88+**. PHP-модулю дополнительно нужен `libphp`,
   собранный с `--enable-embed`, плюс `php-config` и C-тулчейн (у самого ядра
   зависимости от PHP **нет**).
 

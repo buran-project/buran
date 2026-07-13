@@ -10,7 +10,7 @@
 [![Tests](https://github.com/buran-project/buran/actions/workflows/tests.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/tests.yml)
 [![Security Scan](https://github.com/buran-project/buran/actions/workflows/scan.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/scan.yml)
 [![Release](https://github.com/buran-project/buran/actions/workflows/release.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/Rust-1.85+-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.88+-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Container](https://img.shields.io/badge/ghcr.io-buran--project%2Fburan-2496ED?logo=docker&logoColor=white)](https://github.com/buran-project/buran/pkgs/container/buran)
 [![License](https://img.shields.io/github/license/buran-project/buran)](LICENSE)
 
@@ -62,7 +62,7 @@ Pick your path:
 
 - **Docker** – nothing but a container runtime. The official images bundle
   Buran, a PHP module and opcache.
-- **From source** – Rust **1.85+**. The PHP module additionally needs a
+- **From source** – Rust **1.88+**. The PHP module additionally needs a
   `libphp` built with `--enable-embed` plus `php-config` and a C toolchain (the
   core server has **no** PHP dependency).
 
