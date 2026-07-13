@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use buran_ipc::{FrameHeader, FrameKind, RequestBuilder, BWP_VERSION, FRAME_HEADER_LEN};
+use buran_ipc::{FrameHeader, FrameKind, HelloAck, RequestBuilder, BWP_VERSION, FRAME_HEADER_LEN};
 
 const CHANNEL_FD: i32 = 3;
 const WORK_FD: i32 = 4;
@@ -60,8 +60,9 @@ fn main() -> ExitCode {
     let (hello, payload) = read_frame(&mut ours);
     assert_eq!(hello.kind, FrameKind::Hello, "expected Hello");
     assert_eq!(&payload[..4], buran_ipc::BWP_MAGIC, "bad magic");
-    let ack = u32::to_le_bytes(BWP_VERSION);
-    write_frame(&mut ours, &FrameHeader::new(FrameKind::HelloAck, 0, 4), &ack);
+    // Grant concurrency 1: blocking profile, one in-flight request per worker.
+    let ack = HelloAck { version: BWP_VERSION, concurrency: 1 }.encode();
+    write_frame(&mut ours, &FrameHeader::new(FrameKind::HelloAck, 0, ack.len() as u32), &ack);
 
     // Pre-build one request payload (typical small GET).
     let mut builder = RequestBuilder::new();
