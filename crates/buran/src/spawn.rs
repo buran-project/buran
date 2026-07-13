@@ -140,6 +140,12 @@ struct PrototypeSpawner {
     module_binary: PathBuf,
     app_config: String,
     prototype: Mutex<Option<Prototype>>,
+    /// Per-application environment overlaid on the inherited environment
+    /// (config `environment:`). Workers inherit it via fork.
+    env: Vec<(String, String)>,
+    /// Working directory pinned for the prototype and its workers (config
+    /// `working_directory:`); `None` leaves buran's cwd in place.
+    working_dir: Option<PathBuf>,
     /// Worker end of the shared work socket. Held here so the queue (and
     /// any datagrams in flight) survives a prototype restart.
     work_worker_end: OwnedFd,
@@ -195,6 +201,14 @@ impl PrototypeSpawner {
             // one reader per application routes them into the error log.
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
+        // Per-application env is overlaid on the inherited environment; the
+        // working directory, when set, is pinned before exec. Both propagate
+        // to workers through fork.
+        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
+        if let Some(dir) = &self.working_dir {
+            cmd.current_dir(dir);
+        }
 
         // Safety: dup2 is async-signal-safe; it clears CLOEXEC on the
         // target fds so the child inherits exactly the control channel and
@@ -271,6 +285,8 @@ pub fn make_spawner(
         module_binary,
         app_config: module_app_config(app, &ids),
         prototype: Mutex::new(None),
+        env: app.environment.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        working_dir: app.working_directory.as_ref().map(PathBuf::from),
         work_worker_end: OwnedFd::from(worker_end),
     });
     Ok((Arc::new(move || spawner.spawn_worker()), router_end))

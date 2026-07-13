@@ -37,6 +37,9 @@ pub enum Action {
         index: String,
         /// MIME filter: file is served only if its type matches.
         types: Option<PatternSet>,
+        /// Follow symlinks during resolution (default true). When false,
+        /// paths resolving through a symlink are refused.
+        follow_symlinks: bool,
         /// Opt-out of module source-leak protection.
         serve_sources: bool,
         /// Per-app `execute` extensions of the fallback application
@@ -54,6 +57,7 @@ pub enum Decision<'r> {
         template: &'r str,
         index: &'r str,
         types: Option<&'r PatternSet>,
+        follow_symlinks: bool,
         serve_sources: bool,
         extra_source_exts: &'r [String],
         fallback: Option<&'r Action>,
@@ -162,8 +166,8 @@ fn compile_action(
         return Ok(Action::Route { name: route.clone() });
     }
     if let Some(share) = &action.share {
-        let (template, index, types, serve_sources) = match share {
-            Share::Path(p) => (p.clone(), "index.html".to_string(), None, false),
+        let (template, index, types, follow_symlinks, serve_sources) = match share {
+            Share::Path(p) => (p.clone(), "index.html".to_string(), None, true, false),
             Share::Full(opts) => (
                 opts.share.iter().next().cloned().unwrap_or_default(),
                 opts.index.clone().unwrap_or_else(|| "index.html".to_string()),
@@ -171,6 +175,7 @@ fn compile_action(
                     .as_ref()
                     .map(|t| PatternSet::compile(t.iter().map(String::as_str), true))
                     .transpose()?,
+                opts.follow_symlinks.unwrap_or(true),
                 opts.serve_sources,
             ),
         };
@@ -193,7 +198,15 @@ fn compile_action(
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        return Ok(Action::Share { template, index, types, serve_sources, extra_source_exts, fallback });
+        return Ok(Action::Share {
+            template,
+            index,
+            types,
+            follow_symlinks,
+            serve_sources,
+            extra_source_exts,
+            fallback,
+        });
     }
     if let Some(status) = action.return_ {
         return Ok(Action::Return { status, location: action.location.clone() });
@@ -250,16 +263,23 @@ impl CompiledRoutes {
                     continue;
                 }
                 Action::Application { name } => Decision::Application(name),
-                Action::Share { template, index, types, serve_sources, extra_source_exts, fallback } => {
-                    Decision::Share {
-                        template,
-                        index,
-                        types: types.as_ref(),
-                        serve_sources: *serve_sources,
-                        extra_source_exts,
-                        fallback: fallback.as_deref(),
-                    }
-                }
+                Action::Share {
+                    template,
+                    index,
+                    types,
+                    follow_symlinks,
+                    serve_sources,
+                    extra_source_exts,
+                    fallback,
+                } => Decision::Share {
+                    template,
+                    index,
+                    types: types.as_ref(),
+                    follow_symlinks: *follow_symlinks,
+                    serve_sources: *serve_sources,
+                    extra_source_exts,
+                    fallback: fallback.as_deref(),
+                },
                 Action::Return { status, location } => {
                     Decision::Return { status: *status, location: location.as_deref() }
                 }

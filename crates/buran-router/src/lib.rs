@@ -92,6 +92,8 @@ impl Router {
         }
 
         let http = validated.config.settings.http.clone();
+        // Fix the `Server:` header once for the process lifetime.
+        http1::init_server_header(http.server_version);
         let mut mime_overrides = BTreeMap::new();
         if let Some(static_) = &http.static_ {
             for (mime, exts) in &static_.mime_types {

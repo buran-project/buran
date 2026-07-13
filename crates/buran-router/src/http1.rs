@@ -23,7 +23,23 @@ use crate::{AppState, ListenerKind};
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_HEADERS: usize = 64;
-pub(crate) const SERVER: &str = concat!("buran/", env!("CARGO_PKG_VERSION"));
+/// Full server token including the version.
+pub(crate) const SERVER_FULL: &str = concat!("buran/", env!("CARGO_PKG_VERSION"));
+
+/// Process-global `Server:` header value, fixed once at router startup from
+/// settings.http.server_version. Defaults to the versioned token so unit
+/// tests and standalone callers keep the historical behaviour.
+static SERVER_HEADER: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Called once by `Router::new`. `false` suppresses the version, exposing
+/// only `buran` in the `Server:` header.
+pub(crate) fn init_server_header(with_version: bool) {
+    let _ = SERVER_HEADER.set(if with_version { SERVER_FULL } else { "buran" });
+}
+
+pub(crate) fn server_header() -> &'static str {
+    SERVER_HEADER.get().copied().unwrap_or(SERVER_FULL)
+}
 
 /// AsyncWrite passthrough counting wire bytes for the access log.
 struct CountingWriter<W> {
@@ -305,12 +321,21 @@ pub async fn serve_connection(
                         write_return(&mut wr, status, location, keep_alive).await?;
                         status
                     }
-                    Decision::Share { template, index, types, serve_sources, extra_source_exts, fallback } => {
+                    Decision::Share {
+                        template,
+                        index,
+                        types,
+                        follow_symlinks,
+                        serve_sources,
+                        extra_source_exts,
+                        fallback,
+                    } => {
                         let static_ctx = serve_static::StaticContext {
                             types,
                             mime_overrides: &state.mime_overrides,
                             source_exts: &state.source_exts,
                             extra_source_exts,
+                            follow_symlinks,
                             serve_sources,
                             req_headers: &parsed.headers,
                             head_only: parsed.method == b"HEAD",
@@ -698,7 +723,8 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         }
     }
 
-    let mut head = format!("HTTP/1.1 {} {}\r\nserver: {}\r\n", status, reason_phrase(status), SERVER);
+    let mut head =
+        format!("HTTP/1.1 {} {}\r\nserver: {}\r\n", status, reason_phrase(status), server_header());
     // Worker headers come as `name: value\r\n` lines; hop-by-hop and
     // framing headers are ours to control. response_headers ops: a None
     // value removes the worker's header, Some appends/overrides.
@@ -822,7 +848,8 @@ async fn write_101<W: AsyncWriteExt + Unpin>(
     extra_headers: &[(&str, Option<&str>)],
 ) -> std::io::Result<()> {
     let mut head = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nserver: {SERVER}\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: {}\r\n",
+        "HTTP/1.1 101 Switching Protocols\r\nserver: {}\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: {}\r\n",
+        server_header(),
         ws::accept_key(key),
     );
     for line in worker_headers.split(|&b| b == b'\n') {
@@ -1041,7 +1068,10 @@ pub async fn write_return<W: AsyncWriteExt + Unpin>(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let reason = reason_phrase(status);
-    let mut head = format!("HTTP/1.1 {status} {reason}\r\nserver: {SERVER}\r\ncontent-length: 0\r\n");
+    let mut head = format!(
+        "HTTP/1.1 {status} {reason}\r\nserver: {}\r\ncontent-length: 0\r\n",
+        server_header(),
+    );
     if let Some(loc) = location {
         head.push_str(&format!("location: {loc}\r\n"));
     }
@@ -1069,9 +1099,10 @@ pub async fn write_response<W: AsyncWriteExt + Unpin>(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\nserver: {SERVER}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n",
+        "HTTP/1.1 {status} {reason}\r\nserver: {server}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n",
         body.len(),
         reason = reason_phrase(status),
+        server = server_header(),
     );
     for (name, value) in extra_headers {
         if let Some(value) = value {
