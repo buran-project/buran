@@ -213,10 +213,9 @@ async fn accept_loop(
 }
 
 fn parse_listener_addr(addr: &str) -> anyhow::Result<SocketAddr> {
-    let (host, port) = addr.rsplit_once(':').context("host:port expected")?;
-    let port: u16 = port.parse()?;
-    let ip = if host == "*" { "0.0.0.0".parse()? } else { host.parse()? };
-    Ok(SocketAddr::new(ip, port))
+    // Single source of truth with config validation: `--check-config` and the
+    // actual bind parse listener addresses identically.
+    buran_config::parse_listener_addr(addr).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn bind_reuseport(addr: SocketAddr) -> anyhow::Result<TcpListener> {

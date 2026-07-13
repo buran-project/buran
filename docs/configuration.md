@@ -108,8 +108,9 @@ listeners:
     status: true
 ```
 
-- Host `*` binds all interfaces. IPv6 literals work too (`"[::1]:8080"` style
-  via `host:port`, e.g. `"::1"` as host).
+- Host `*` binds all IPv4 interfaces. IPv6 literals must be bracketed:
+  `"[::1]:8080"`, `"[::]:8080"` for all IPv6 interfaces. The host is an IP
+  literal or `*` — hostnames are not resolved.
 - The referenced `route` must exist. `route` + `status: true` together is an
   error; so is a listener with neither.
 

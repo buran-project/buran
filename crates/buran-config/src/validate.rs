@@ -271,16 +271,44 @@ fn validate_application(app: &Application, path: &str) -> Result<(), ConfigError
 }
 
 fn validate_listener_addr(addr: &str, path: &str) -> Result<(), ConfigError> {
-    let (host, port) = addr
-        .rsplit_once(':')
-        .ok_or_else(|| ConfigError::invalid(path, "listener address must be \"host:port\" or \"*:port\""))?;
-    if host.is_empty() {
-        return Err(ConfigError::invalid(path, "listener host must not be empty (use \"*\" for any)"));
+    parse_listener_addr(addr).map(|_| ()).map_err(|msg| ConfigError::invalid(path, msg))
+}
+
+/// Parse a listener address into a bindable `SocketAddr`. Accepts
+/// `host:port`, `*:port` (any IPv4) and bracketed `[ipv6]:port`. The host
+/// must be an IP literal or `*` — no name resolution. Shared by validation
+/// and the router so `--check-config` can never disagree with the bind.
+pub fn parse_listener_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
+    let (host, port) = split_host_port(addr)?;
+    let port: u16 = port.parse().map_err(|_| format!("\"{port}\" is not a valid port"))?;
+    let ip: std::net::IpAddr = if host == "*" {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        host.parse()
+            .map_err(|_| format!("\"{host}\" is not a valid IP address (use \"[..]\" for IPv6, \"*\" for any)"))?
+    };
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+/// Split a listener address into (host, port), honoring `[ipv6]:port`.
+fn split_host_port(addr: &str) -> Result<(&str, &str), String> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| "missing \"]\" in IPv6 listener address".to_string())?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| "expected \":port\" after \"]\" in IPv6 listener address".to_string())?;
+        Ok((host, port))
+    } else {
+        let (host, port) = addr.rsplit_once(':').ok_or_else(|| {
+            "listener address must be \"host:port\", \"*:port\" or \"[ipv6]:port\"".to_string()
+        })?;
+        if host.is_empty() {
+            return Err("listener host must not be empty (use \"*\" for any)".to_string());
+        }
+        Ok((host, port))
     }
-    port.parse::<u16>().map_err(|_| {
-        ConfigError::invalid(path, format!("\"{port}\" is not a valid port"))
-    })?;
-    Ok(())
 }
 
 fn available<'a>(keys: impl Iterator<Item = &'a String>) -> String {

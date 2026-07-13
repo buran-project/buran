@@ -10,7 +10,7 @@ mod subst;
 mod validate;
 
 pub use schema::*;
-pub use validate::Validated;
+pub use validate::{parse_listener_addr, Validated};
 
 use thiserror::Error;
 
