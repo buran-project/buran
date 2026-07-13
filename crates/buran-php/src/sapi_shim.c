@@ -201,7 +201,10 @@ int bphp_sapi_request(const char *filename,
                       long content_length,
                       const char *auth_header)
 {
-    int status = -1;
+    /* volatile: modified across the setjmp/longjmp boundary of zend_first_try.
+       Unconditionally rewritten on both exits here, so the standard doesn't
+       strictly require it, but kept for parity with bphp_exec in embed_shim.c. */
+    volatile int status = -1;
 
     SG(server_context) = (void *)1; /* non-NULL: request is active */
     SG(request_info).request_method = method;
