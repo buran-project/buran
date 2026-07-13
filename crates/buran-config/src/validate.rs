@@ -195,6 +195,18 @@ fn validate_action(
         ));
     }
 
+    // Multiple candidate paths (Unit-style fallback search) are not
+    // implemented: the router silently uses only the first. Reject the array
+    // rather than quietly ignore the rest.
+    if let Some(Share::Full(opts)) = &action.share {
+        if opts.share.len() != 1 {
+            return Err(ConfigError::invalid(
+                format!("{path}.share"),
+                "\"share\" takes exactly one path; a list of candidate paths is not supported",
+            ));
+        }
+    }
+
     if action.fallback.is_some() && action.share.is_none() {
         return Err(ConfigError::invalid(
             format!("{path}.fallback"),

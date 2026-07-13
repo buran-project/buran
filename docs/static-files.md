@@ -22,7 +22,7 @@ Pass an object to control indexing, extension filtering and symlinks:
 
 ```yaml
 - action:
-    share: /var/www$uri            # one path or a list of candidates
+    share: /var/www$uri            # a single path template
     index: index.html             # directory index file
     types: ["!*.php"]             # extension allow/deny patterns
     follow_symlinks: false        # refuse to serve through symlinks
@@ -31,7 +31,7 @@ Pass an object to control indexing, extension filtering and symlinks:
 
 | Field | Meaning |
 |-------|---------|
-| `share` | One path template, or a list of candidates tried in order. |
+| `share` | A single path template. |
 | `index` | File served when the resolved path is a directory. |
 | `types` | Pattern set filtering which files may be served (same syntax as [route patterns](routing.md#pattern-syntax)). |
 | `follow_symlinks` | When `false`, paths resolving through a symlink are refused. |

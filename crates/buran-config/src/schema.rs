@@ -19,6 +19,17 @@ impl<T> OneOrMany<T> {
             Self::Many(v) => v.iter(),
         }
     }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
