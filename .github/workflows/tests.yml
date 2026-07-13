@@ -1,0 +1,176 @@
+# PR gate: unit tests + build & verify of EVERY matrix cell, legacy included.
+#
+# Buran positions itself as the lifeboat for codebases that cannot migrate
+# off old PHP branches — legacy cells (7.3-8.1) are first-class citizens
+# here, so every PR proves the whole matrix still builds and serves.
+#
+# Pipeline shape: build once, reuse everywhere. `build` bakes every cell a
+# single time and stashes each image as an artifact; `images` and
+# `applications` load those artifacts and run their suites — nothing gets
+# rebuilt downstream. The cell list is read from `docker buildx bake --print`;
+# docker-bake.hcl stays the single source of truth.
+
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # buran-php needs libphp to link and is covered per-cell below; everything
+  # else builds and tests on the bare runner.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo test --locked -p buran -p buran-router -p buran-config -p buran-ipc -p buran-worker
+
+  # Discovery, single source of truth for what runs downstream:
+  #   cells — every buildable image from the `default` bake group. `lang`
+  #           drives which suites a cell runs; minimal cells carry no module
+  #           and no lang, so they smoke-only.
+  #   apps  — one entry per tests/applications/<app>/ dir that has a run.sh.
+  #           The base target is read straight from the run.sh's BAKE_TARGET
+  #           (its single source of truth), the image is joined in from cells.
+  #           Drop a new app dir and it registers itself; no edit here.
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.cells.outputs.cells }}
+      apps: ${{ steps.apps.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List cells from bake
+        id: cells
+        run: |
+          set -eu
+          cells="$(docker buildx bake --print default 2>/dev/null | jq -c '
+            [.target | to_entries[] | {
+              target: .key,
+              image:  .value.tags[0],
+              lang:   (.value.labels["dev.buran.lang"]   // ""),
+              module: (.value.labels["dev.buran.module"] // "")
+            }]')"
+          echo "cells=$cells" >> "$GITHUB_OUTPUT"
+
+      - name: Discover applications
+        id: apps
+        env:
+          CELLS: ${{ steps.cells.outputs.cells }}
+        run: |
+          set -eu
+          apps='[]'
+          for dir in tests/applications/*/; do
+            [ -f "${dir}run.sh" ] || continue
+            app="$(basename "$dir")"
+            target="$(sed -n 's/^BAKE_TARGET="\([^"]*\)".*/\1/p' "${dir}run.sh" | head -1)"
+            [ -n "$target" ] || { echo "!! $app: run.sh has no BAKE_TARGET"; exit 1; }
+            image="$(printf '%s' "$CELLS" | jq -r --arg t "$target" '.[] | select(.target==$t) | .image')"
+            [ -n "$image" ] || { echo "!! $app: target '$target' not found among cells"; exit 1; }
+            apps="$(printf '%s' "$apps" | jq -c \
+              --arg a "$app" --arg t "$target" --arg i "$image" \
+              '. + [{app:$a, target:$t, image:$i}]')"
+          done
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+
+  # Single builder: each cell is baked exactly once and shipped as an artifact
+  # (docker save | zstd). gha cache stays scoped per target as a best-effort
+  # warm start between runs; correctness no longer depends on it.
+  #
+  # Gated on `unit`: no point baking the whole matrix and running e2e if the
+  # core crates don't even pass their unit tests. `images`/`applications` chain
+  # off `build`, so the gate covers them transitively.
+  build:
+    needs: [matrix, unit]
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
+    name: build ${{ matrix.cell.target }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.cell.target }}
+        run: |
+          docker buildx bake "${{ matrix.cell.target }}" --load \
+            --set "*.platform=linux/amd64" \
+            --set "*.cache-from=type=gha,scope=${{ matrix.cell.target }}" \
+            --set "*.cache-to=type=gha,scope=${{ matrix.cell.target }},mode=max"
+
+      - name: Save image
+        run: docker save "${{ matrix.cell.image }}" | zstd -T0 -o image.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: img-${{ matrix.cell.target }}
+          path: image.tar.zst
+          retention-days: 1
+          compression-level: 0 # already zstd-compressed
+
+  # Per-image test battery: smoke on every cell, golden where a suite exists
+  # for the cell's language. New language modules light up automatically by
+  # dropping a tests/golden/<lang>/run.sh — no change here.
+  images:
+    needs: [matrix, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJSON(needs.matrix.outputs.cells) }}
+    name: ${{ matrix.cell.target }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: img-${{ matrix.cell.target }}
+
+      - name: Load image
+        run: zstd -d -c image.tar.zst | docker load
+
+      - name: Smoke
+        run: tests/smoke/run.sh "${{ matrix.cell.image }}" "${{ matrix.cell.module }}"
+
+      - name: Golden contract
+        run: |
+          lang="${{ matrix.cell.lang }}"
+          runner="tests/golden/${lang}/run.sh"
+          if [ -n "$lang" ] && [ -x "$runner" ]; then
+            "$runner" "${{ matrix.cell.image }}" "${{ matrix.cell.module }}"
+          else
+            echo ">> no golden suite for lang='${lang}', skipping"
+          fi
+
+  # Framework e2e, every app on every PR. The matrix is discovered from the
+  # tests/applications/ dirs (see the `matrix` job); each app loads its
+  # prebuilt base and only compose-builds the thin app layer on top of it.
+  applications:
+    needs: [matrix, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.matrix.outputs.apps) }}
+    name: e2e ${{ matrix.entry.app }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: img-${{ matrix.entry.target }}
+
+      - name: Load base image
+        run: zstd -d -c image.tar.zst | docker load
+
+      - name: Run ${{ matrix.entry.app }} e2e
+        env:
+          BURAN_IMAGE: ${{ matrix.entry.image }}
+        run: tests/applications/${{ matrix.entry.app }}/run.sh

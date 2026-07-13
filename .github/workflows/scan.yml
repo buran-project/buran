@@ -1,0 +1,73 @@
+# Weekly vulnerability scan of the published images. Fails on HIGH/CRITICAL
+# findings with an available fix and publishes them to the Security tab, one
+# category per image.
+#
+# Scope: the `supported` bake group only. Legacy cells (php 7.3-8.1) live on
+# EOL bases by design — built once, never rebuilt, findings permanent — so
+# scanning them would just train everyone to ignore a red workflow. The image
+# list is read from `docker buildx bake --print`, docker-bake.hcl stays the
+# single source of truth.
+
+name: security scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # Monday 03:00 UTC
+
+env:
+  REPO: ghcr.io/${{ github.repository }}
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.list.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect canonical tags of the supported group
+        id: list
+        run: |
+          set -eu
+          tags="$(docker buildx bake --print supported 2>/dev/null \
+            | jq -c '[.target[].tags[0]]')"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.matrix.outputs.tags) }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy scan ${{ matrix.image }}
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: latest
+          image-ref: ${{ matrix.image }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+          # one category per image, otherwise uploads overwrite each other
+          category: trivy-${{ matrix.image }}

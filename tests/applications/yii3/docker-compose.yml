@@ -1,0 +1,15 @@
+# Yii3 on Buran e2e.
+#
+#   ./run.sh          full cycle: up, checks, teardown
+#   KEEP=1 ./run.sh   leave running at http://127.0.0.1:8188
+
+services:
+  buran:
+    build:
+      context: .
+      args:
+        BURAN_IMAGE: ${BURAN_IMAGE:-buran:php-8.3}
+    ports:
+      - "8188:8188"
+    volumes:
+      - ./buran.yaml:/etc/buran/buran.yaml:ro

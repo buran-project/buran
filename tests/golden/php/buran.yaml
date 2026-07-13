@@ -1,0 +1,34 @@
+# Buran side of the golden contract — semantically equivalent to
+# nginx-fpm/nginx.conf: dynamic app on 8080, front controller on 8081.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8080":
+    route: dyn
+  "*:8081":
+    route: front
+
+routes:
+  dyn:
+    - action:
+        application: dyn
+
+  front:
+    - action:
+        share: /www$uri
+        fallback:
+          application: front
+
+applications:
+  dyn:
+    module: ${BURAN_GOLDEN_MODULE}
+    root: /www
+    index: index.php
+    processes: 2
+
+  front:
+    module: ${BURAN_GOLDEN_MODULE}
+    root: /www
+    script: index.php
+    processes: 2

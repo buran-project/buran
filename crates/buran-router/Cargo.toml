@@ -1,0 +1,24 @@
+[package]
+name = "buran-router"
+description = "Buran router: HTTP/1.1, routing, rewrites, static files, worker dispatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false # internal, not part of the public SDK surface
+
+[dependencies]
+buran-config = { workspace = true }
+buran-ipc = { workspace = true }
+tokio = { workspace = true }
+httparse = { workspace = true }
+async-channel = { workspace = true }
+rustix = { workspace = true }
+regex = { workspace = true }
+socket2 = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+memchr = { workspace = true }
+sha1 = { workspace = true }
+base64 = { workspace = true }

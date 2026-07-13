@@ -1,0 +1,22 @@
+# Smoke config for PHP images; the module comes from the environment so one
+# config serves every cell of the matrix: BURAN_SMOKE_MODULE=php73..php85.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8080":
+    route: main
+
+routes:
+  main:
+    - action:
+        share: /www$uri
+        fallback:
+          application: app
+
+applications:
+  app:
+    module: ${BURAN_SMOKE_MODULE}
+    root: /www
+    index: index.php
+    processes: 2

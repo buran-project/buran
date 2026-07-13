@@ -1,0 +1,79 @@
+# Example Buran configuration for local development.
+# Run: cargo run -p buran -- --config examples/buran.yaml
+
+settings:
+  modules: ./target/debug          # buran-php lives here during development
+  http:
+    max_body_size: 8388608
+    static:
+      mime_types:
+        text/x-buran: [".brn"]
+
+listeners:
+  "127.0.0.1:8180":
+    route: main
+  "127.0.0.1:9190":
+    status: true
+
+routes:
+  main:
+    # static assets go straight from disk
+    - match:
+        uri: ["/assets/*", "*.ico"]
+      action:
+        share: ./examples/public$uri
+
+    - match:
+        uri: "/old"
+      action:
+        return: 301
+        location: /
+
+    # rewrite demo: pretty URLs -> front controller with the page argument
+    - match:
+        uri: "/page/*"
+      action:
+        rewrite: /index.php?page=$uri
+        application: site
+        response_headers:
+          x-rewritten: "1"
+          x-powered-by: null   # strip whatever PHP sets
+
+    # full match demo: local debug endpoint, GET only, with a header guard
+    - match:
+        uri: "/debug"
+        method: GET
+        source: ["127.0.0.0/8", "::1"]
+        headers:
+          x-debug-token: "sesame"
+      action:
+        return: 204
+
+    # try static files first, everything else goes to PHP. No `!*.php`
+    # needed: the php module declares .php/.phtml/.phar as sources and the
+    # router refuses to serve them as static files by design.
+    - action:
+        share: ./examples/public$uri
+        fallback:
+          application: site
+
+applications:
+  site:
+    module: php
+    root: ./examples/public
+    index: index.php
+    processes: { max: 8, spare: 1, idle_timeout: 2 }
+    # concurrency: 64   # cap per worker; only matters for event-loop
+    #                   # runtimes (blocking modules always run at 1)
+    limits:
+      timeout: 30
+      requests: 5        # tiny value to demo worker recycling
+    options:
+      admin:
+        opcache.enable: "1"
+        opcache.memory_consumption: 192
+        memory_limit: 256M
+      user:
+        display_errors: "0"
+
+access_log: /tmp/buran-access.log

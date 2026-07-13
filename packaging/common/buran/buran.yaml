@@ -1,0 +1,16 @@
+# Buran Application Server — default configuration shipped by packages.
+# Serves static files from /var/www; add applications per your runtime
+# modules (`buran --modules` lists what is installed).
+# Reference: https://github.com/buran-project/buran
+
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8080":
+    route: main
+
+routes:
+  main:
+    - action:
+        share: /var/www$uri

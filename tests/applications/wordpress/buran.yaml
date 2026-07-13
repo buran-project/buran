@@ -1,0 +1,46 @@
+# WordPress: classic try-files + front controller.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8184":
+    route: main
+
+routes:
+  main:
+    # real PHP entry points (wp-login.php, wp-admin/*.php, ...) run directly
+    - match:
+        uri: ["*.php", "*.php/*"]
+      action:
+        application: wordpress
+
+    # everything else: static file if it exists, otherwise the front
+    # controller (pretty permalinks, /wp-json/, ...)
+    - action:
+        share:
+          share: /www$uri
+        fallback:
+          application: wordpress-front
+
+applications:
+  wordpress:
+    module: php84   # buran-php84 in the modules dir (image is built on 8.4)
+    root: /www
+    index: index.php
+    processes: 3
+    options:
+      admin:
+        opcache.enable: "1"
+        memory_limit: 256M
+
+  # Front-controller target: same tree, fixed script. Separate pool until
+  # BWP multi-target lands (app_target is already reserved in the protocol).
+  wordpress-front:
+    module: php84
+    root: /www
+    script: index.php
+    processes: 8
+    options:
+      admin:
+        opcache.enable: "1"
+        memory_limit: 256M

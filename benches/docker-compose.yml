@@ -1,0 +1,61 @@
+# Buran benchmark suite: three identical PHP hello-world stacks.
+#
+#   buran      :8081   Buran (built from this repo)
+#   freeunit   :8082   FreeUnit (ghcr.io, same php:8.4-cli-trixie lineage)
+#   nginx+fpm  :8083   the classic (nginx + php-fpm 8.4, static pool)
+#
+# host networking on purpose: docker-proxy would dominate the measurement.
+# Linux only. Run: ./run.sh
+#
+# Docker 25+ gives containers a soft nofile limit of 1024, which caps every
+# stack at ~1000 concurrent connections; raise it so C10K measures the
+# servers, not the ulimit.
+
+x-bench-ulimits: &bench-ulimits
+  nofile:
+    soft: 1048576
+    hard: 1048576
+
+services:
+  buran:
+    build:
+      context: ..
+      dockerfile: docker/php-debian.Dockerfile
+      args:
+        PHP_VERSION: "8.4"
+        BASE: "trixie"
+    network_mode: host
+    ulimits: *bench-ulimits
+    volumes:
+      - ./app:/www:ro
+      - ./configs/buran.yaml:/etc/buran/buran.yaml:ro
+
+  freeunit:
+    image: ghcr.io/freeunitorg/freeunit:latest-php8.4
+    network_mode: host
+    ulimits: *bench-ulimits
+    volumes:
+      - ./app:/www:ro
+      - ./configs/freeunit.json:/docker-entrypoint.d/config.json:ro
+      - freeunit-run:/var/run
+
+  fpm:
+    image: php:8.4-fpm-trixie
+    network_mode: host
+    ulimits: *bench-ulimits
+    volumes:
+      - ./app:/www:ro
+      - ./configs/fpm-pool.conf:/usr/local/etc/php-fpm.d/zz-bench.conf:ro
+
+  nginx:
+    image: nginx:stable
+    network_mode: host
+    ulimits: *bench-ulimits
+    depends_on:
+      - fpm
+    volumes:
+      - ./app:/www:ro
+      - ./configs/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  freeunit-run:

@@ -1,0 +1,24 @@
+[package]
+name = "buran"
+description = "Buran Application Server: supervisor, module discovery, CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false # server binary, shipped as images/distro packages
+
+[[bin]]
+name = "buran"
+path = "src/main.rs"
+
+[dependencies]
+buran-config = { workspace = true }
+buran-router = { workspace = true }
+buran-ipc = { workspace = true }
+nix = { workspace = true }
+serde_norway = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

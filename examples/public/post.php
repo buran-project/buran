@@ -1,0 +1,1 @@
+<?php echo "post: a=" . ($_POST["a"] ?? "-") . " b=" . ($_POST["b"] ?? "-") . " len=" . $_SERVER["CONTENT_LENGTH"] . "\n";

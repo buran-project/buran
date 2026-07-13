@@ -1,0 +1,28 @@
+Source: buran
+Section: httpd
+Priority: optional
+Maintainer: Buran Project <buran@example.invalid>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.85),
+               php-dev,
+               libphp-embed | libphp8.4-embed
+Standards-Version: 4.7.0
+Homepage: https://github.com/buran-project/buran
+Rules-Requires-Root: no
+
+Package: buran
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Buran universal application server
+ High-performance application server: static files, routing/rewrites and
+ language runtimes (PHP via embed SAPI) behind one process tree with a
+ static YAML configuration.
+
+Package: buran-php
+Architecture: any
+Depends: buran (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: Buran universal application server - PHP runtime module
+ PHP runtime module for Buran, linked against the PHP version shipped by
+ this distribution release. The module binary carries the version in its
+ name (e.g. buran-php84), matching `module:` in buran.yaml one to one.

@@ -1,0 +1,12 @@
+# Smoke config for minimal images: static serving only, no modules.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8080":
+    route: main
+
+routes:
+  main:
+    - action:
+        share: /www$uri

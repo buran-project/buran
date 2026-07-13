@@ -1,0 +1,18 @@
+# Bench: 8 static PHP workers, everything to the app.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8081":
+    route: main
+  "127.0.0.1:9191":
+    status: true
+
+routes:
+  main:
+    - action:
+        application:
+          module: php84   # buran-php84 in the modules dir (bench image is 8.4)
+          root: /www
+          index: index.php
+          processes: 16

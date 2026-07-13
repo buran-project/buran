@@ -1,0 +1,1 @@
+<?php echo "page=" . ($_GET["page"] ?? "-") . " uri=" . $_SERVER["REQUEST_URI"] . " qs=" . $_SERVER["QUERY_STRING"] . "\n";

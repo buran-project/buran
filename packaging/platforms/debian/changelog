@@ -1,0 +1,6 @@
+buran (0.1.0) unstable; urgency=medium
+
+  * Reference packaging entry. The release workflow rewrites this file with
+    the tagged version before building.
+
+ -- Buran Project <buran@example.invalid>  Sun, 12 Jul 2026 06:00:00 +0300

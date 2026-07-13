@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Env / local secrets
+.env
+.env.local
+
+# Profiling / flamegraph output
+*.profraw
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Criterion benchmark reports
+/criterion/
+
+# AI agents
+/.claude
+
+# Garbage
+/.wip

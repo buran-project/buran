@@ -1,0 +1,31 @@
+# Buran Application Server.
+#
+# The main process stays root (like nginx/php-fpm masters): it binds
+# listeners and spawns per-application prototypes; application workers drop
+# to the user/group given in the config (default: buran, see sysusers.d).
+
+[Unit]
+Description=Buran Application Server
+Documentation=https://github.com/buran-project/buran
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStartPre=/usr/sbin/buran --check-config --config /etc/buran/buran.yaml
+ExecStart=/usr/sbin/buran --config /etc/buran/buran.yaml
+# Config is static by design: a change is a restart, there is no reload.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+
+# The workers, not the unit, drop privileges — keep the hardening that does
+# not interfere with setuid/setgid and listener binding.
+NoNewPrivileges=no
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

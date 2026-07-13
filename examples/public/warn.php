@@ -1,0 +1,1 @@
+<?php error_log("test warning from php"); echo "logged\n";

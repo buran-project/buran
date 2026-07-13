@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="buran"
+description="Buran Application Server"
+
+command="/usr/sbin/buran"
+command_args="--config /etc/buran/buran.yaml"
+supervisor=supervise-daemon
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	/usr/sbin/buran --check-config --config /etc/buran/buran.yaml
+}

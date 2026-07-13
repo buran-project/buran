@@ -1,0 +1,26 @@
+# Golden case matrix: name|mode|method|uri
+# dyn = dynamic/CGI-like app (index resolution, PATH_INFO), front = front controller.
+root|dyn|GET|/
+index-direct|dyn|GET|/index.php
+pathinfo|dyn|GET|/dump.php/extra
+pathinfo-slash|dyn|GET|/dump.php/extra/
+pathinfo-encoded|dyn|GET|/dump.php/a%20b
+pathinfo-deep|dyn|GET|/dump.php/a/b/c
+query-simple|dyn|GET|/dump.php?a=b
+query-empty|dyn|GET|/dump.php?
+query-repeat|dyn|GET|/dump.php?a=1&a=2
+query-brackets|dyn|GET|/dump.php?a[]=1&a[]=2
+query-pathinfo|dyn|GET|/dump.php/extra?x=1&y=%20z
+encoded-script|dyn|GET|/%64ump.php
+dotdot|dyn|GET|/dir/../dump.php
+double-slash|dyn|GET|//dump.php
+dir-slash|dyn|GET|/dir/
+dir-noslash|dyn|GET|/dir
+missing-php|dyn|GET|/nope.php
+missing-file|dyn|GET|/nothing.txt
+head-index|dyn|HEAD|/index.php
+front-root|front|GET|/
+front-pretty|front|GET|/blog/hello-world
+front-pretty-query|front|GET|/blog/hello?page=2
+front-encoded|front|GET|/caf%C3%A9
+front-asset-missing|front|GET|/assets/app.css

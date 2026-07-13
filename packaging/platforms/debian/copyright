@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: buran
+Source: https://github.com/buran-project/buran
+
+Files: *
+Copyright: 2026 Buran Project Contributors
+License: Apache-2.0
+ See /usr/share/common-licenses/Apache-2.0 (LICENSE in the source tree).

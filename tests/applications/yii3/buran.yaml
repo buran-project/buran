@@ -1,0 +1,21 @@
+# Yii3: front controller on public/.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8188":
+    route: main
+
+routes:
+  main:
+    - action:
+        share: /www/public$uri
+        fallback:
+          application: yii3
+
+applications:
+  yii3:
+    module: php83
+    root: /www/public
+    script: index.php
+    processes: 4

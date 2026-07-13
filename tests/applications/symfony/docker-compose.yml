@@ -1,0 +1,15 @@
+# Symfony on Buran e2e.
+#
+#   ./run.sh          full cycle: up, checks, teardown
+#   KEEP=1 ./run.sh   leave running at http://127.0.0.1:8187
+
+services:
+  buran:
+    build:
+      context: .
+      args:
+        BURAN_IMAGE: ${BURAN_IMAGE:-buran:php-8.5}
+    ports:
+      - "8187:8187"
+    volumes:
+      - ./buran.yaml:/etc/buran/buran.yaml:ro

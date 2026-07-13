@@ -1,0 +1,15 @@
+# Yii2 on Buran e2e (PHP 7.4 — the legacy lane).
+#
+#   ./run.sh          full cycle: up, checks, teardown
+#   KEEP=1 ./run.sh   leave running at http://127.0.0.1:8186
+
+services:
+  buran:
+    build:
+      context: .
+      args:
+        BURAN_IMAGE: ${BURAN_IMAGE:-buran:php-7.4-debian}
+    ports:
+      - "8186:8186"
+    volumes:
+      - ./buran.yaml:/etc/buran/buran.yaml:ro

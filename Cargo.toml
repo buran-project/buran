@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/buran",
+    "crates/buran-router",
+    "crates/buran-config",
+    "crates/buran-ipc",
+    "crates/buran-worker",
+    "crates/buran-php",
+    "crates/buran-echo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/buran-project/buran"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# A `version` is required only on deps pulled in by a *published* crate
+# (buran-worker -> buran-ipc) — crates.io resolves the registry copy by it.
+# The rest stay path-only; their crates are publish = false.
+buran-config = { path = "crates/buran-config" }
+buran-ipc = { path = "crates/buran-ipc", version = "0.1.0" }
+buran-router = { path = "crates/buran-router" }
+buran-worker = { path = "crates/buran-worker" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "process", "time", "io-util", "sync", "macros", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nix = { version = "0.31", features = ["socket", "uio", "process", "signal", "user", "fs"] }
+rustix = { version = "1.0", features = ["fs", "net", "process"] }
+httparse = "1.9"
+async-channel = "2"
+regex = "1"
+socket2 = { version = "0.6", features = ["all"] }
+bytes = "1"
+memchr = "2"
+sha1 = "0.11"
+base64 = "0.22"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,22 @@
+[package]
+name = "buran-php"
+description = "Buran PHP runtime module: embedded libphp via custom SAPI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false # links libphp; cargo publish verify-build can't satisfy it
+
+[[bin]]
+name = "buran-php"
+path = "src/main.rs"
+
+[dependencies]
+buran-worker = { workspace = true }
+buran-ipc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true }
+
+[build-dependencies]
+cc = "1"

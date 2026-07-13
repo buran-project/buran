@@ -1,0 +1,16 @@
+[package]
+name = "buran-echo"
+description = "Reference event-loop runtime module: concurrent BWP profile (echo)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false # reference module, not shipped to crates.io
+
+[dependencies]
+buran-ipc = { workspace = true }
+buran-worker = { workspace = true }
+tokio = { workspace = true }
+nix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

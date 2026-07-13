@@ -1,0 +1,21 @@
+# Symfony: front controller on public/.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8187":
+    route: main
+
+routes:
+  main:
+    - action:
+        share: /www/public$uri
+        fallback:
+          application: symfony
+
+applications:
+  symfony:
+    module: php85
+    root: /www/public
+    script: index.php
+    processes: 4

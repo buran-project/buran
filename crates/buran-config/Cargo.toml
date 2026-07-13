@@ -1,0 +1,13 @@
+[package]
+name = "buran-config"
+description = "Buran configuration: schema, validation, ${ENV} substitution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false # internal, not part of the public SDK surface
+
+[dependencies]
+serde = { workspace = true }
+serde_norway = { workspace = true }
+thiserror = { workspace = true }

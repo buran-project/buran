@@ -1,0 +1,1 @@
+<?php echo "len=" . strlen(file_get_contents("php://input")) . " md5=" . md5(file_get_contents("php://input")) . "\n";

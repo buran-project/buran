@@ -1,0 +1,241 @@
+# Release: build the full image matrix and publish to GHCR + Docker Hub.
+#
+# Trigger: a bare x.y.z tag (no "v" prefix), e.g. `git tag 0.1.0 && git push --tags`.
+#
+# Topology: each platform builds natively on its own runner (no QEMU — Rust
+# release builds under emulation take hours) and pushes every tag with an
+# arch suffix (…-amd64 / …-arm64); the merge job then stitches the clean
+# multi-arch tags out of those with `imagetools create`. The tag list is not
+# duplicated here — it is read back from `docker buildx bake --print`, so
+# docker-bake.hcl stays the single source of truth.
+#
+# Docker Hub publishing is commented out for now (paid org); to re-enable,
+# uncomment the login steps below, append the repo to REPO and set up:
+#   - Actions variable DOCKERHUB_REPO  — Docker Hub repository
+#   - Secret DOCKERHUB_USERNAME        — Docker Hub login
+#   - Secret DOCKERHUB_TOKEN           — Docker Hub access token (Read & Write)
+# GHCR needs nothing: GITHUB_TOKEN with packages:write is used.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  # Docker Hub: append ",docker.io/${{ vars.DOCKERHUB_REPO }}"
+  REPO: ghcr.io/${{ github.repository }}
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  # Discover the package build matrix from packaging/platforms/ — one entry per
+  # dir with a ci-build.sh. The builder image (rpm -> fedora, not derivable from
+  # the dir name) is read from the recipe's `# ci-image:` marker. Add a platform
+  # dir and it registers itself; no edit here.
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.list.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Discover platforms
+        id: list
+        run: |
+          set -eu
+          pkgs='[]'
+          for dir in packaging/platforms/*/; do
+            [ -f "${dir}ci-build.sh" ] || continue
+            distro="$(basename "$dir")"
+            image="$(sed -n 's/^# ci-image: *\([^ ]*\).*/\1/p' "${dir}ci-build.sh" | head -1)"
+            [ -n "$image" ] || { echo "!! $distro: ci-build.sh has no '# ci-image:' marker"; exit 1; }
+            pkgs="$(printf '%s' "$pkgs" | jq -c \
+              --arg d "$distro" --arg i "$image" '. + [{distro:$d, image:$i}]')"
+          done
+          echo "packages=$pkgs" >> "$GITHUB_OUTPUT"
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: amd64
+            runner: ubuntu-latest
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # - uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push per-arch tags
+        env:
+          TAG_SUFFIX: -${{ matrix.platform }}
+        run: |
+          docker buildx bake --push \
+            --set "*.platform=linux/${{ matrix.platform }}"
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # - uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Stitch multi-arch manifests
+        run: |
+          set -eu
+          docker buildx bake --print 2>/dev/null \
+            | jq -r '[.target[].tags[]] | unique | .[]' \
+            | while read -r t; do
+                echo ">> $t"
+                docker buildx imagetools create -t "$t" "$t-amd64" "$t-arm64"
+              done
+
+  # GitHub release + tarballs: sources and vendored crates (the latter is
+  # what distro maintainers need — official builds have no network).
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build source and vendor tarballs
+        run: |
+          set -eu
+          git archive --format=tar.gz --prefix="buran-$VERSION/" \
+            -o "buran-$VERSION.tar.gz" HEAD
+          cargo vendor vendor >/dev/null
+          tar czf "buran-$VERSION-vendor.tar.gz" vendor
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$VERSION" --verify-tag --generate-notes \
+            "buran-$VERSION.tar.gz" "buran-$VERSION-vendor.tar.gz"
+
+  # Publish the SDK crates to crates.io so third parties can build runtime
+  # modules. Only buran-ipc + buran-worker are public (the rest are
+  # publish = false); leaf-first, since crates.io must already know a dep when
+  # its dependents are pushed. Gated on `build`: crates.io is immutable (yank,
+  # never delete), so we don't publish until the code compiles on both arches.
+  crates:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches crate version
+        run: |
+          set -eu
+          v="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="buran-ipc") | .version')"
+          [ "$v" = "$VERSION" ] || {
+            echo "!! tag $VERSION does not match crate version $v — bump Cargo.toml first"
+            exit 1
+          }
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          # Idempotent by design: rebuilding the same release (re-pushing the
+          # tag to republish images after a distro CVE patch, or retrying a
+          # half-failed run) must not try to re-upload a version that already
+          # exists — crates.io forbids that. Skip crates already on the registry
+          # and only publish genuinely new ones. Order stays leaf-first; cargo
+          # (>=1.66) blocks until each crate is indexed before the next.
+          ua="buran-release (+https://github.com/buran-project/buran)"
+          published() {
+            code="$(curl -s -o /dev/null -w '%{http_code}' -A "$ua" \
+              "https://crates.io/api/v1/crates/$1/$VERSION")"
+            [ "$code" = "200" ]
+          }
+          for crate in buran-ipc buran-worker; do
+            if published "$crate"; then
+              echo ">> $crate $VERSION already on crates.io — skipping"
+            else
+              cargo publish --locked -p "$crate"
+            fi
+          done
+
+  # Distro packages, each recipe built in a clean container of its target
+  # distro — doubles as the CI proof that packaging/ recipes stay alive. The
+  # matrix is discovered from packaging/platforms/ (see the `matrix` job).
+  packages:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.matrix.outputs.packages) }}
+    name: package ${{ matrix.entry.distro }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build packages in ${{ matrix.entry.image }}
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
+            -e VERSION "${{ matrix.entry.image }}" \
+            sh "/src/packaging/platforms/${{ matrix.entry.distro }}/ci-build.sh"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.entry.distro }}
+          path: dist/*
+
+  publish-packages:
+    needs: [release, packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach packages to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$VERSION" dist/* --clobber

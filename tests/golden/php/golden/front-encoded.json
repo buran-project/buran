@@ -1,0 +1,24 @@
+{
+  "status": 200,
+  "content_type": "application/json",
+  "location": null,
+  "server": {
+    "CONTENT_LENGTH": "",
+    "CONTENT_TYPE": "",
+    "DOCUMENT_ROOT": "/www",
+    "DOCUMENT_URI": "/index.php",
+    "GATEWAY_INTERFACE": "CGI/1.1",
+    "HTTP_ACCEPT": "*/*",
+    "HTTP_HOST": "127.0.0.1:18082",
+    "PHP_SELF": "/index.php",
+    "QUERY_STRING": "",
+    "REDIRECT_STATUS": "200",
+    "REQUEST_METHOD": "GET",
+    "REQUEST_SCHEME": "http",
+    "REQUEST_URI": "/caf%C3%A9",
+    "SCRIPT_FILENAME": "/www/index.php",
+    "SCRIPT_NAME": "/index.php",
+    "SERVER_PORT": "8081",
+    "SERVER_PROTOCOL": "HTTP/1.1"
+  }
+}

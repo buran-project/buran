@@ -1,0 +1,21 @@
+# Laravel: classic try-files + front controller on public/.
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8185":
+    route: main
+
+routes:
+  main:
+    - action:
+        share: /www/public$uri
+        fallback:
+          application: laravel
+
+applications:
+  laravel:
+    module: php84
+    root: /www/public
+    script: index.php
+    processes: 4

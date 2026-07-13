@@ -1,0 +1,58 @@
+# WordPress on Buran — the MVP exit criterion of the spec (section 2.13).
+#
+#   ./run.sh          full cycle: up, install, checks, teardown
+#   KEEP=1 ./run.sh   leave running at http://127.0.0.1:8184
+
+services:
+  db:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: unpack pristine WordPress + our wp-config and the probe mu-plugin
+  # into the volume.
+  wp-src:
+    image: wordpress:fpm-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        if [ ! -f /www/wp-settings.php ]; then
+          cp -a /usr/src/wordpress/. /www/
+          cp /config/wp-config.php /www/wp-config.php
+          mkdir -p /www/wp-content/mu-plugins
+          cp /config/buran-probe.php /www/wp-content/mu-plugins/buran-probe.php
+          chmod -R a+rX /www
+        fi
+    volumes:
+      - wp:/www
+      - ./wp-config.php:/config/wp-config.php:ro
+      - ./buran-probe.php:/config/buran-probe.php:ro
+
+  buran:
+    # Extends the stock image with what WordPress needs (mysqli, APCu) —
+    # see Dockerfile. Build the base first: docker buildx bake php-8-4-debian
+    build:
+      context: .
+      args:
+        BURAN_IMAGE: ${BURAN_IMAGE:-buran:php-8.4}
+    depends_on:
+      db:
+        condition: service_healthy
+      wp-src:
+        condition: service_completed_successfully
+    ports:
+      - "8184:8184"
+    volumes:
+      - wp:/www
+      - ./buran.yaml:/etc/buran/buran.yaml:ro
+
+volumes:
+  wp:

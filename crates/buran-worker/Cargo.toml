@@ -1,0 +1,12 @@
+[package]
+name = "buran-worker"
+description = "Buran worker SDK: BWP worker-side loop for runtime modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+buran-ipc = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

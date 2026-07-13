@@ -1,0 +1,21 @@
+# Yii2 basic app: front controller on web/, default query routing (?r=).
+settings:
+  modules: /usr/lib/buran/modules
+
+listeners:
+  "*:8186":
+    route: main
+
+routes:
+  main:
+    - action:
+        share: /www/web$uri
+        fallback:
+          application: yii2
+
+applications:
+  yii2:
+    module: php74
+    root: /www/web
+    script: index.php
+    processes: 4

@@ -1,0 +1,41 @@
+#!/usr/bin/make -f
+# Reference packaging, CI-verified on every release. Note for an official
+# Debian upload: this build fetches crates from crates.io (not allowed on
+# buildds) — vendor them or use packaged librust-* crates at that point.
+
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+
+# Debian ships the embed library with the version in its name
+# (libphp8.4.so); derive the link name and module suffix from php-config.
+PHP_SUFFIX := $(shell php-config --version | awk -F. '{print $$1$$2}')
+PHP_LIB    := php$(shell php-config --version | awk -F. '{print $$1"."$$2}')
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked -p buran
+	BURAN_PHP_LIB=$(PHP_LIB) cargo build --release --locked -p buran-php
+
+override_dh_auto_install:
+	install -Dm755 target/release/buran \
+		debian/buran/usr/sbin/buran
+	install -Dm644 packaging/common/buran/buran.yaml \
+		debian/buran/etc/buran/buran.yaml
+	install -dm755 debian/buran/usr/lib/buran/modules
+	install -Dm755 target/release/buran-php \
+		debian/buran-php/usr/lib/buran/modules/buran-php$(PHP_SUFFIX)
+
+# systemd units/sysusers/tmpfiles live in packaging/common/systemd/ (single
+# source of truth shared with the rpm recipe) — stage them where debhelper
+# looks, before any of the install helpers run.
+execute_after_dh_auto_install:
+	cp packaging/common/systemd/buran.service debian/buran.service
+	cp packaging/common/systemd/buran.sysusers.conf debian/buran.sysusers
+	cp packaging/common/systemd/buran.tmpfiles.conf debian/buran.tmpfiles
+
+override_dh_auto_test:
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home debian/buran.service \
+		debian/buran.sysusers debian/buran.tmpfiles
