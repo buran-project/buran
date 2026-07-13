@@ -95,6 +95,10 @@ Notes:
   limits (`limits.response_timeout` / `limits.task_timeout`) and
   `http.idle_timeout` do **not** apply to an upgraded tunnel; only
   `websocket.idle_timeout` does.
+- **Keep-alive is HTTP/1.1 only.** An HTTP/1.0 request with
+  `Connection: keep-alive` is served, but the connection is closed after the
+  response (no HTTP/1.0 persistent connections). Put a modern reverse proxy in
+  front if HTTP/1.0 keep-alive matters.
 
 ## `listeners`
 

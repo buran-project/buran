@@ -73,11 +73,10 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
     let mime = mime_for(&target, ctx.mime_overrides);
 
     // MIME filter: a non-matching type is "not served" -> fallback.
-    if let Some(types) = ctx.types {
-        if !types.matches(mime.as_bytes(), true) {
+    if let Some(types) = ctx.types
+        && !types.matches(mime.as_bytes(), true) {
             return Ok(None);
         }
-    }
 
     let rel = target.trim_start_matches('/').to_string();
     if rel.is_empty() {

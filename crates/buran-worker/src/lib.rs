@@ -278,8 +278,6 @@ where
     }
 
     // Requests arrive on the shared work socket; wait on it AND the control
-
-    // Requests arrive on the shared work socket; wait on it AND the control
     // stream at once so an idle worker can answer a Ping. Non-blocking recv:
     // poll may wake several idle workers but only one wins the datagram.
     work.set_nonblocking(true)?;
@@ -396,7 +394,11 @@ fn read_hello_ack(stream: &mut UnixStream) -> Result<HelloAck, WorkerError> {
     }
     let header = FrameHeader::decode(&head)?;
     if header.kind != FrameKind::HelloAck {
-        return Err(BwpError::BadMagic.into());
+        return Err(std::io::Error::other(format!(
+            "handshake: expected HelloAck, got frame kind {}",
+            header.kind as u8
+        ))
+        .into());
     }
     // Grow with the data; a bogus payload_len hits EOF rather than pre-allocating.
     let want = u64::from(header.payload_len);

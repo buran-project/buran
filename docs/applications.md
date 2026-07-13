@@ -209,6 +209,25 @@ is closed and the worker released.
 > workers serves at most *N* concurrent streams, so size `processes` for the
 > expected number of long-lived connections (SSE especially).
 
+### Behavior notes
+
+A few intentional behaviors worth knowing about:
+
+- **`php_sapi_name()` returns `cli-server`.** The Buran SAPI reports the name
+  `cli-server` (it lets opcache's SAPI whitelist accept the runtime). Apps or
+  libraries that branch on the SAPI name — some frameworks special-case PHP's
+  built-in dev server — will see `cli-server`, not `fpm-fcgi`.
+- **Directory redirects are `http://`.** A request for a directory without a
+  trailing slash gets a `301` to `http://<Host>/…`. Behind a TLS terminator
+  this is an `https → http` downgrade in the `Location`. For now, avoid relying
+  on directory-redirects behind TLS (link to the trailing-slash form
+  directly); `X-Forwarded-Proto` awareness is planned.
+- **`max_execution_time` is CPU time, not wall-clock.** It does not count
+  `sleep()`/IO, so it cannot bound a background job — that is what
+  `limits.task_timeout` is for (see [limits](#limits)). Set
+  `max_execution_time` below `limits.task_timeout` so PHP kills a CPU runaway
+  cleanly first.
+
 ## How modules work (BWP)
 
 Runtime modules communicate with the router over the **Buran Worker Protocol

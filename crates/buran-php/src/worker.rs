@@ -39,6 +39,12 @@ mod ffi {
     }
 }
 
+/// One `$_SERVER` entry: (name offset, value offset, value length) into the
+/// shared arena.
+type VarEntry = (usize, usize, usize);
+/// Serialized `$_SERVER`: the NUL-terminated name arena plus its entries.
+type ServerVars = (Vec<u8>, Vec<VarEntry>);
+
 /// Per-request state reachable from the C callbacks. Single worker thread,
 /// set strictly for the duration of one `bphp_sapi_request` call.
 struct RequestCtx {
@@ -54,7 +60,7 @@ struct RequestCtx {
     /// (offset, len) ranges. One buffer, reused across requests.
     vars_arena: Vec<u8>,
     /// (name_off, value_off, value_len) into `vars_arena`.
-    vars_entries: Vec<(usize, usize, usize)>,
+    vars_entries: Vec<VarEntry>,
     /// Response header block under construction.
     resp_status: u16,
     resp_headers: Vec<u8>,
@@ -103,7 +109,8 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
     let entries_ptr = if entries.is_empty() {
         std::ptr::null()
     } else {
-        let c = CString::new(entries).map_err(|_| WorkerError::Closed)?;
+        let c = CString::new(entries)
+            .map_err(|_| std::io::Error::other("ini directive contains a NUL byte"))?;
         let ptr = c.as_ptr();
         std::mem::forget(c);
         ptr
@@ -111,7 +118,7 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
 
     // Safety: single-threaded, once per process.
     if unsafe { ffi::bphp_sapi_boot(ini_ptr, entries_ptr) } != 0 {
-        return Err(WorkerError::Closed);
+        return Err(std::io::Error::other("php engine boot failed").into());
     }
     Ok(())
 }
@@ -263,11 +270,13 @@ fn handle(
     }
 
     // Script produced no output at all: headers were never flushed by PHP.
-    if let Some(ctx) = leftover {
-        if !ctx.headers_sent {
+    if let Some(ctx) = leftover
+        && !ctx.headers_sent {
+            // Two status sources: the one the script set (`http_response_code`)
+            // and the engine's exit status. Take the max so an engine error
+            // (5xx) is never masked by a script's 2xx/3xx — a fatal wins.
             resp.send_headers(ctx.resp_status.max(status as u16), &ctx.resp_headers)?;
         }
-    }
 
     resp.finish()
 }
@@ -280,6 +289,13 @@ struct ResolvedScript {
 
 /// Intrinsic executable extensions of this runtime; `app.execute` extends
 /// the set (legacy "PHP in .html" deployments).
+///
+/// Deliberately narrower than `--describe`'s `source_extensions` (which also
+/// lists `.phar`): `--describe` drives source-leak protection (what the router
+/// must NOT serve as a static file — a `.phar` is PHP source and must be
+/// hidden), while this set is what we actually hand to the engine as a script.
+/// A `.phar` is executed only via an explicit `script`/`index`, not by
+/// extension, so it is not intrinsic here.
 const INTRINSIC_EXTS: [&str; 2] = [".php", ".phtml"];
 
 /// CGI-like script resolution per spec section 2.5 (matches what frameworks
@@ -348,7 +364,7 @@ fn build_server_vars(
     req: &RequestView<'_>,
     app: &AppConfig,
     script: &ResolvedScript,
-) -> Result<(Vec<u8>, Vec<(usize, usize, usize)>), WorkerError> {
+) -> Result<ServerVars, WorkerError> {
     // Single arena instead of ~25 CString allocations per request: names
     // NUL-terminated in-place, values addressed by (offset, len).
     let mut arena: Vec<u8> = Vec::with_capacity(1024);

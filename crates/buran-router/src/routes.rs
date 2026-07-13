@@ -304,11 +304,10 @@ impl Step {
     fn matches(&self, meta: &RequestMeta<'_>, path: &[u8], query: &[u8]) -> bool {
         let Some(m) = &self.matcher else { return true };
 
-        if let Some(set) = &m.method {
-            if !set.matches(meta.method, false) {
+        if let Some(set) = &m.method
+            && !set.matches(meta.method, false) {
                 return false;
             }
-        }
         if let Some(set) = &m.host {
             // Host header may carry a port: match on the name part.
             let host = match memchr::memchr(b':', meta.host) {
@@ -319,16 +318,14 @@ impl Step {
                 return false;
             }
         }
-        if let Some(set) = &m.uri {
-            if !set.matches(path, false) {
+        if let Some(set) = &m.uri
+            && !set.matches(path, false) {
                 return false;
             }
-        }
-        if let Some(set) = &m.query {
-            if !set.matches(query, false) {
+        if let Some(set) = &m.query
+            && !set.matches(query, false) {
                 return false;
             }
-        }
         for (name, set) in &m.headers {
             let value = meta
                 .headers
@@ -353,11 +350,10 @@ impl Step {
                 }
             }
         }
-        if let Some(cidr) = &m.source {
-            if !cidr.matches(meta.remote) {
+        if let Some(cidr) = &m.source
+            && !cidr.matches(meta.remote) {
                 return false;
             }
-        }
         true
     }
 }

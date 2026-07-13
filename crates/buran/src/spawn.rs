@@ -37,22 +37,20 @@ fn resolve_ids(app: &Application) -> anyhow::Result<DropIds> {
     let user = app
         .user
         .as_deref()
-        .map(|name| {
-            nix::unistd::User::from_name(name)
-                .ok()
-                .flatten()
-                .ok_or_else(|| anyhow::anyhow!("unknown user \"{name}\""))
+        .map(|name| match nix::unistd::User::from_name(name) {
+            Ok(Some(u)) => Ok(u),
+            Ok(None) => Err(anyhow::anyhow!("unknown user \"{name}\"")),
+            // A lookup error (EIO / NSS down) must not read as "no such user".
+            Err(e) => Err(anyhow::anyhow!("looking up user \"{name}\": {e}")),
         })
         .transpose()?;
     let explicit_gid = app
         .group
         .as_deref()
-        .map(|name| {
-            nix::unistd::Group::from_name(name)
-                .ok()
-                .flatten()
-                .map(|g| g.gid.as_raw())
-                .ok_or_else(|| anyhow::anyhow!("unknown group \"{name}\""))
+        .map(|name| match nix::unistd::Group::from_name(name) {
+            Ok(Some(g)) => Ok(g.gid.as_raw()),
+            Ok(None) => Err(anyhow::anyhow!("unknown group \"{name}\"")),
+            Err(e) => Err(anyhow::anyhow!("looking up group \"{name}\": {e}")),
         })
         .transpose()?;
 
@@ -252,11 +250,10 @@ impl Spawn for PrototypeSpawner {
         // workers died with it). The command reaches the worker's parent, which
         // SIGKILLs by the pid it forked — pid-reuse safe.
         let guard = self.prototype.lock().expect("prototype lock");
-        if let Some(proto) = guard.as_ref() {
-            if let Err(e) = send_kill(&proto.control, token) {
+        if let Some(proto) = guard.as_ref()
+            && let Err(e) = send_kill(&proto.control, token) {
                 warn!(app = %self.app_name, "kill worker token {token}: {e}");
             }
-        }
     }
 }
 

@@ -40,18 +40,16 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
 
     // Privilege drop; group first (setuid drops the right to setgid).
     // Workers inherit the identity via fork.
-    if let Some(gid) = app.group_id {
-        if let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)) {
+    if let Some(gid) = app.group_id
+        && let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)) {
             eprintln!("buran-echo prototype: setgid({gid}) failed: {e}");
             std::process::exit(1);
         }
-    }
-    if let Some(uid) = app.user_id {
-        if let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)) {
+    if let Some(uid) = app.user_id
+        && let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)) {
             eprintln!("buran-echo prototype: setuid({uid}) failed: {e}");
             std::process::exit(1);
         }
-    }
 
     // token -> child pid, for reuse-safe kills by the parent.
     let mut workers: HashMap<u64, Pid> = HashMap::new();

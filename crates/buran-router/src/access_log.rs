@@ -1,16 +1,26 @@
-//! Access log: combined format, one writer task fed over an unbounded
-//! channel so connection tasks never block on disk.
+//! Access log: combined format, one writer task fed over a *bounded* channel
+//! so connection tasks never block on disk. When the disk cannot keep up the
+//! channel fills and lines are dropped (never buffered without limit); the
+//! loss count is surfaced in the log itself — honest for an edge server.
 //!
 //! Deviation from nginx combined, documented: the bytes field counts wire
 //! bytes of the response (headers included), not body bytes only.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+/// Bounded backlog of pending log lines (~lines, not bytes). Beyond this the
+/// disk is not keeping up and further lines are dropped.
+const CHANNEL_CAPACITY: usize = 8192;
+
 pub struct AccessLog {
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
+    /// Lines dropped since the last one written (disk backpressure).
+    dropped: Arc<AtomicU64>,
 }
 
 impl AccessLog {
@@ -20,12 +30,22 @@ impl AccessLog {
         let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
         let file = tokio::fs::File::from_std(file);
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = mpsc::channel::<String>(CHANNEL_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let dropped_writer = Arc::clone(&dropped);
         tokio::spawn(async move {
             let mut out = tokio::io::BufWriter::new(file);
             while let Some(line) = rx.recv().await {
                 if out.write_all(line.as_bytes()).await.is_err() {
                     break;
+                }
+                // Surface any lines lost to backpressure since the last write.
+                let lost = dropped_writer.swap(0, Ordering::Relaxed);
+                if lost > 0 {
+                    let notice = format!("#buran: dropped {lost} access log line(s) under backpressure\n");
+                    if out.write_all(notice.as_bytes()).await.is_err() {
+                        break;
+                    }
                 }
                 // Flush per line: log lines must not sit in a buffer when
                 // the container is killed.
@@ -35,7 +55,7 @@ impl AccessLog {
             }
         });
 
-        Ok(AccessLog { tx })
+        Ok(AccessLog { tx, dropped })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -57,7 +77,11 @@ impl AccessLog {
             referer = referer.map(String::from_utf8_lossy).unwrap_or_default(),
             user_agent = user_agent.map(String::from_utf8_lossy).unwrap_or_default(),
         );
-        let _ = self.tx.send(line);
+        // Never block a connection task on disk: a full channel (disk behind)
+        // or a gone writer drops the line and bumps the loss counter.
+        if self.tx.try_send(line).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

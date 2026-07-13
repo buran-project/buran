@@ -1,12 +1,11 @@
 //! buran-php — PHP runtime module (spec section 2.5).
 //!
 //! Modes:
-//! - `--describe`                            module contract, JSON to stdout
-//! - `--prototype --control <fd> --work <fd> --app-config <json>`
-//!                                           boot once, fork warm workers
-//! - `--channel <fd> --work <fd> --app-config <json>`
-//!                                           standalone BWP worker
-//! - `--exec <script.php> [n]`               phase-0 PoC over the embed SAPI
+//! - `--describe` — module contract, JSON to stdout
+//! - `--prototype --control <fd> --work <fd> --app-config <json>` — boot once,
+//!   fork warm workers
+//! - `--channel <fd> --work <fd> --app-config <json>` — standalone BWP worker
+//! - `--exec <script.php> [n]` — phase-0 PoC over the embed SAPI
 
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;

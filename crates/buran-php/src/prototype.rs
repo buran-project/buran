@@ -70,12 +70,11 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
             std::process::exit(1);
         }
     }
-    if let Some(uid) = app.user_id {
-        if let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)) {
+    if let Some(uid) = app.user_id
+        && let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)) {
             eprintln!("buran-php prototype: setuid({uid}) failed: {e}");
             std::process::exit(1);
         }
-    }
 
     if let Err(e) = worker::boot(&app) {
         eprintln!("buran-php prototype: engine boot failed: {e}");

@@ -501,11 +501,10 @@ fn parse_request(head: &[u8]) -> Option<Parsed> {
                 // v0: chunked request bodies are not supported yet.
                 parsed.bad = Some(411);
             }
-            b"connection" => {
-                if h.value.eq_ignore_ascii_case(b"close") {
+            b"connection"
+                if h.value.eq_ignore_ascii_case(b"close") => {
                     parsed.keep_alive = false;
                 }
-            }
             _ => {}
         }
         parsed.headers.push((name, h.value.to_vec()));
@@ -1245,19 +1244,26 @@ pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         101 => "Switching Protocols",
         200 => "OK",
+        204 => "No Content",
+        206 => "Partial Content",
         301 => "Moved Permanently",
         302 => "Found",
         304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         408 => "Request Timeout",
         411 => "Length Required",
         413 => "Content Too Large",
+        416 => "Range Not Satisfiable",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        // A worker may return any code; an empty reason-phrase is RFC-valid.
         _ => "",
     }
 }

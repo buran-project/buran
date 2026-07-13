@@ -408,12 +408,11 @@ impl Pool {
     /// task stays tracked past the client response.
     fn remove_if_unclaimed(&self, id: u32) {
         let mut pending = self.pending.lock().expect("pending lock");
-        if let Some(p) = pending.get(&id) {
-            if p.claimed_by.is_none() {
+        if let Some(p) = pending.get(&id)
+            && p.claimed_by.is_none() {
                 pending.remove(&id);
                 self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
             }
-        }
     }
 
     /// Send an `Abort` to the worker claiming task `id` (client gone, response
@@ -452,14 +451,12 @@ impl Pool {
                         p.aborted_at = Some(now);
                         to_abort.push(id);
                     }
-                } else if let Some(aborted_at) = p.aborted_at {
-                    if now.duration_since(aborted_at) >= grace {
-                        if let Some(w) = p.claimed_by {
+                } else if let Some(aborted_at) = p.aborted_at
+                    && now.duration_since(aborted_at) >= grace
+                        && let Some(w) = p.claimed_by {
                             let e = defiant.entry(w).or_insert((0, id));
                             e.0 += 1;
                         }
-                    }
-                }
             }
         }
 
