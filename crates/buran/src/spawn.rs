@@ -22,21 +22,29 @@ use tracing::{info, warn};
 const CONTROL_FD: i32 = 3;
 const WORK_FD: i32 = 4;
 
+/// Resolved privilege-drop identity for an application.
+#[derive(Default)]
+struct DropIds {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    /// User name, forwarded so the prototype can call initgroups.
+    user_name: Option<String>,
+}
+
 /// Resolve `user`/`group` names to numeric ids at startup (fail fast: a
 /// typo in a username must not surface as a prototype crash loop).
-fn resolve_ids(app: &Application) -> anyhow::Result<(Option<u32>, Option<u32>)> {
-    let uid = app
+fn resolve_ids(app: &Application) -> anyhow::Result<DropIds> {
+    let user = app
         .user
         .as_deref()
         .map(|name| {
             nix::unistd::User::from_name(name)
                 .ok()
                 .flatten()
-                .map(|u| u.uid.as_raw())
                 .ok_or_else(|| anyhow::anyhow!("unknown user \"{name}\""))
         })
         .transpose()?;
-    let gid = app
+    let explicit_gid = app
         .group
         .as_deref()
         .map(|name| {
@@ -48,15 +56,21 @@ fn resolve_ids(app: &Application) -> anyhow::Result<(Option<u32>, Option<u32>)> 
         })
         .transpose()?;
 
+    // When only `user` is set, fall back to that user's primary group so the
+    // gid is dropped too; otherwise the worker would keep buran's gid.
+    let gid = explicit_gid.or_else(|| user.as_ref().map(|u| u.gid.as_raw()));
+    let uid = user.as_ref().map(|u| u.uid.as_raw());
+    let user_name = user.map(|u| u.name);
+
     if (uid.is_some() || gid.is_some()) && !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!("application user/group is set but buran is not running as root");
     }
-    Ok((uid, gid))
+    Ok(DropIds { uid, gid, user_name })
 }
 
 /// JSON slice of the application config owned by the module (spec 2.4:
 /// main validates the common part, the module knows its own fields).
-fn module_app_config(app: &Application, uid: Option<u32>, gid: Option<u32>) -> String {
+fn module_app_config(app: &Application, ids: &DropIds) -> String {
     let ini_file = app
         .options
         .as_ref()
@@ -98,8 +112,9 @@ fn module_app_config(app: &Application, uid: Option<u32>, gid: Option<u32>) -> S
         "admin": ini_map("admin"),
         "user": ini_map("user"),
         "max_requests": app.limits.requests,
-        "user_id": uid,
-        "group_id": gid,
+        "user_id": ids.uid,
+        "group_id": ids.gid,
+        "user_name": ids.user_name,
         "execute": app.execute,
     })
     .to_string()
@@ -247,14 +262,14 @@ pub fn make_spawner(
     module_binary: PathBuf,
     app: &Application,
 ) -> anyhow::Result<(Spawner, UnixDatagram)> {
-    let (uid, gid) = resolve_ids(app).with_context(|| format!("application {app_name}"))?;
+    let ids = resolve_ids(app).with_context(|| format!("application {app_name}"))?;
 
     let (router_end, worker_end) = UnixDatagram::pair().context("work socketpair")?;
 
     let spawner = Arc::new(PrototypeSpawner {
         app_name: app_name.to_string(),
         module_binary,
-        app_config: module_app_config(app, uid, gid),
+        app_config: module_app_config(app, &ids),
         prototype: Mutex::new(None),
         work_worker_end: OwnedFd::from(worker_end),
     });
@@ -327,8 +342,13 @@ applications:
 ",
         );
 
+        let ids = DropIds {
+            uid: Some(1000),
+            gid: Some(33),
+            user_name: Some("www-data".to_string()),
+        };
         let json: serde_json::Value =
-            serde_json::from_str(&module_app_config(&app, Some(1000), Some(33))).unwrap();
+            serde_json::from_str(&module_app_config(&app, &ids)).unwrap();
 
         // Relative root is absolutized against the cwd.
         let root = json["root"].as_str().unwrap();
@@ -343,6 +363,7 @@ applications:
         assert_eq!(json["max_requests"], 0);
         assert_eq!(json["user_id"], 1000);
         assert_eq!(json["group_id"], 33);
+        assert_eq!(json["user_name"], "www-data");
         assert_eq!(json["execute"][0], ".html");
     }
 
@@ -361,7 +382,7 @@ applications:
 ",
         );
         let json: serde_json::Value =
-            serde_json::from_str(&module_app_config(&app, None, None)).unwrap();
+            serde_json::from_str(&module_app_config(&app, &DropIds::default())).unwrap();
         assert_eq!(json["root"], "");
         assert!(json["script"].is_null());
         assert!(json["ini_file"].is_null());
@@ -384,6 +405,7 @@ applications:
     module: php85
 ",
         );
-        assert_eq!(resolve_ids(&app).unwrap(), (None, None));
+        let ids = resolve_ids(&app).unwrap();
+        assert_eq!((ids.uid, ids.gid, ids.user_name), (None, None, None));
     }
 }

@@ -23,10 +23,32 @@ pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
     let control = unsafe { UnixStream::from_raw_fd(control_fd) };
     let work = unsafe { UnixDatagram::from_raw_fd(work_fd) };
 
-    // Privilege drop before the engine boots; group first (setuid drops the
-    // right to setgid). Workers inherit the identity via fork.
+    // Privilege drop before the engine boots; groups first, then gid, then
+    // uid (setuid drops the right to change the others). Workers inherit the
+    // identity via fork.
     if let Some(gid) = app.group_id {
-        if let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)) {
+        let gid = nix::unistd::Gid::from_raw(gid);
+        // Reset supplementary groups before dropping. Skipping this leaves a
+        // root-started worker carrying root's supplementary groups — an
+        // incomplete privilege drop (php-fpm calls initgroups for the same
+        // reason). With the user name known, initgroups installs that user's
+        // own groups; otherwise we at least strip inherited ones down to the
+        // primary gid.
+        let groups_res = match app.user_name.as_deref() {
+            Some(name) => match std::ffi::CString::new(name) {
+                Ok(cname) => nix::unistd::initgroups(&cname, gid),
+                Err(_) => {
+                    eprintln!("buran-php prototype: user name contains NUL");
+                    std::process::exit(1);
+                }
+            },
+            None => nix::unistd::setgroups(&[gid]),
+        };
+        if let Err(e) = groups_res {
+            eprintln!("buran-php prototype: dropping supplementary groups failed: {e}");
+            std::process::exit(1);
+        }
+        if let Err(e) = nix::unistd::setgid(gid) {
             eprintln!("buran-php prototype: setgid({gid}) failed: {e}");
             std::process::exit(1);
         }
