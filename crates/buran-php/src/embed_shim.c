@@ -17,7 +17,8 @@ int bphp_init(void)
  * Returns the script exit status, or -1 on bailout (fatal error). */
 int bphp_exec(const char *filename)
 {
-    int status = -1;
+    /* volatile: modified across the setjmp/longjmp boundary of zend_first_try */
+    volatile int status = -1;
 
     zend_first_try {
         zend_file_handle file_handle;

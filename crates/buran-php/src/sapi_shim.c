@@ -31,7 +31,10 @@ extern void   buran_cb_finish_request(void);
 void bphp_register_var(void *track_vars_array, const char *name,
                        const char *value, size_t value_len)
 {
-    php_register_variable_safe((const char *)name, (const char *)value,
+    /* Takes char* before 8.0 (gained const in 8.0); cast to char* works on
+       both. Safe: PHP may rewrite the name buffer in place for array-style
+       keys, but our $_SERVER keys have no brackets and the arena is writable. */
+    php_register_variable_safe((char *)name, (char *)value,
                                value_len, (zval *)track_vars_array);
 }
 
@@ -91,8 +94,8 @@ static void buran_register_variables(zval *track_vars_array)
     buran_cb_register_vars((void *)track_vars_array);
 }
 
-#if PHP_VERSION_ID < 70400
-/* the message parameter gained const in 7.4 */
+#if PHP_VERSION_ID < 80000
+/* the message parameter gained const in 8.0 */
 static void buran_log_message(char *message, int syslog_type_int)
 #else
 static void buran_log_message(const char *message, int syslog_type_int)
@@ -198,7 +201,10 @@ int bphp_sapi_request(const char *filename,
                       long content_length,
                       const char *auth_header)
 {
-    int status = -1;
+    /* volatile: modified across the setjmp/longjmp boundary of zend_first_try.
+       Unconditionally rewritten on both exits here, so the standard doesn't
+       strictly require it, but kept for parity with bphp_exec in embed_shim.c. */
+    volatile int status = -1;
 
     SG(server_context) = (void *)1; /* non-NULL: request is active */
     SG(request_info).request_method = method;
