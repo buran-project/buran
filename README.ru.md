@@ -95,7 +95,7 @@ applications:
     module: php85                  # → /usr/lib/buran/modules/buran-php85
     root: /www
     index: index.php
-    processes: 2
+    processes: auto                 # по воркеру на ядро (по умолчанию; с учётом cgroup-квоты)
 ```
 
 ### 2. Запустите 🐳

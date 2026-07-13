@@ -84,7 +84,7 @@ applications:
     module: php85                  # → /usr/lib/buran/modules/buran-php85
     root: /www
     index: index.php
-    processes: 2
+    processes: auto                 # 每个 CPU 一个 worker（默认值；受 cgroup 配额限制）
 ```
 
 ### 2. 运行 🐳
