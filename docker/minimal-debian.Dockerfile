@@ -39,6 +39,13 @@ FROM debian:${BASE}-slim
 LABEL org.opencontainers.image.title="Buran Application Server"
 LABEL org.opencontainers.image.description="Buran universal application server, minimal (static files and routing only)"
 
+# Pull Debian security patches: the base image freezes its APT packages at
+# publish time, so they drift behind the trixie security repo. Upgrade in place
+# so image scanners see the patched versions.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=core /buran /usr/sbin/buran
 
 # Static configuration by design: mount your config at /etc/buran/buran.yaml

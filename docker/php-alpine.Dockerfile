@@ -98,7 +98,10 @@ LABEL org.opencontainers.image.description="Buran universal application server, 
 # The plain `php` command ships only with the distro-default branch — the
 # ecosystem (composer, wp-cli's `env php` shebang) expects it, so symlink
 # the image's own version when the package did not provide it.
-RUN apk add --no-cache libgcc ${PHP_PKG} ${PHP_PKG}-embed ${OPCACHE_PKG} ${EXTRA_PKGS} \
+# `apk upgrade` first pulls any Alpine security patches the pinned base tag
+# has drifted behind, so image scanners see the fixed package versions.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache libgcc ${PHP_PKG} ${PHP_PKG}-embed ${OPCACHE_PKG} ${EXTRA_PKGS} \
     && { command -v php >/dev/null || ln -s ${PHP_PKG} /usr/bin/php; }
 
 COPY --from=core /buran /usr/sbin/buran

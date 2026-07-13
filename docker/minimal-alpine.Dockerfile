@@ -37,6 +37,10 @@ FROM alpine:${BASE}
 LABEL org.opencontainers.image.title="Buran Application Server"
 LABEL org.opencontainers.image.description="Buran universal application server, minimal (static files and routing only)"
 
+# Pull any Alpine security patches the pinned base tag has drifted behind so
+# image scanners see the fixed package versions.
+RUN apk upgrade --no-cache
+
 COPY --from=core /buran /usr/sbin/buran
 
 # Static configuration by design: mount your config at /etc/buran/buran.yaml
