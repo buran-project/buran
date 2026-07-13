@@ -48,7 +48,7 @@ COPY crates/ crates/
 FROM rust AS core
 ARG BASE
 
-RUN --mount=type=cache,target=/opt/cargo/registry \
+RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/buran/target,id=buran-core-alpine-${BASE},sharing=locked \
     cargo build --release -p buran \
     && install -m 755 -s target/release/buran /buran
@@ -68,7 +68,7 @@ RUN apk add --no-cache ${PHP_PKG}-dev ${PHP_PKG}-embed
 # The installed name is versioned (buran-php85) — it is what `module:` in
 # the config resolves 1:1 (spec: exact match, no fuzzy), so several PHP
 # versions can live side by side in one modules dir.
-RUN --mount=type=cache,target=/opt/cargo/registry \
+RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/buran/target,id=buran-php-${PHP_VERSION}-alpine,sharing=locked \
     so="/$(apk info -qL ${PHP_PKG}-embed | grep '\.so$')" \
     && libdir="$(dirname "$so")" \

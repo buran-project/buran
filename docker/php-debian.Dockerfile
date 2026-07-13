@@ -43,7 +43,7 @@ COPY crates/ crates/
 FROM rust AS core
 ARG BASE
 
-RUN --mount=type=cache,target=/opt/cargo/registry \
+RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/buran/target,id=buran-core-debian-${BASE},sharing=locked \
     cargo build --release -p buran \
     && install -m 755 -s target/release/buran /buran
@@ -67,7 +67,7 @@ COPY crates/ crates/
 # The installed name is versioned (buran-php85) — it is what `module:` in
 # the config resolves 1:1 (spec: exact match, no fuzzy), so several PHP
 # versions can live side by side in one modules dir.
-RUN --mount=type=cache,target=/opt/cargo/registry \
+RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/buran/target,id=buran-php-${PHP_VERSION}-${BASE},sharing=locked \
     so="$(find "$(php-config --prefix)/lib" -maxdepth 1 -name 'libphp*.so' | head -n1)" \
     && libname="$(basename "$so" .so)" && libname="${libname#lib}" \

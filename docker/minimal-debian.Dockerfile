@@ -28,7 +28,7 @@ COPY crates/ crates/
 FROM rust AS core
 ARG BASE
 
-RUN --mount=type=cache,target=/opt/cargo/registry \
+RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/buran/target,id=buran-core-debian-${BASE},sharing=locked \
     cargo build --release -p buran \
     && install -m 755 -s target/release/buran /buran
