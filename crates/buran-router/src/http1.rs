@@ -1309,6 +1309,57 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_conflicting_duplicate_content_length() {
+        // Two disagreeing Content-Length headers: a request-smuggling vector
+        // on keep-alive, rejected outright (RFC 9110 8.6).
+        let raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_allows_duplicate_matching_content_length() {
+        // Identical duplicates are harmless (RFC 9110 8.6 permits collapsing).
+        let raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n";
+        let p = parse_request(raw).unwrap();
+        assert!(p.bad.is_none());
+        assert_eq!(p.content_length, 10);
+    }
+
+    #[test]
+    fn parse_rejects_missing_host_on_http11() {
+        // RFC 9110 7.2: HTTP/1.1 must carry exactly one Host.
+        let raw = b"GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_allows_missing_host_on_http10() {
+        // The single-Host requirement is 1.1-only; 1.0 may omit it.
+        let raw = b"GET / HTTP/1.0\r\n\r\n";
+        assert!(parse_request(raw).unwrap().bad.is_none());
+    }
+
+    #[test]
+    fn parse_rejects_multiple_host_headers_http11() {
+        let raw = b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_rejects_multiple_host_headers_http10_too() {
+        // More than one Host is malformed / a routing-confusion vector at any
+        // version, not just 1.1.
+        let raw = b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_accepts_single_host_http11() {
+        let raw = b"GET / HTTP/1.1\r\nHost: only.one\r\n\r\n";
+        assert!(parse_request(raw).unwrap().bad.is_none());
+    }
+
+    #[test]
     fn parse_honors_connection_close() {
         let raw = b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
         assert!(!parse_request(raw).unwrap().keep_alive);

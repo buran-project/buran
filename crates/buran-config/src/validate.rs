@@ -316,6 +316,15 @@ fn split_host_port(addr: &str) -> Result<(&str, &str), String> {
         if host.is_empty() {
             return Err("listener host must not be empty (use \"*\" for any)".to_string());
         }
+        // A colon left in the host means a bare IPv6 literal: the host:port
+        // split is ambiguous (the colons are both address separators and the
+        // port delimiter), so rsplit would silently pick some arbitrary
+        // interpretation. Force brackets instead of guessing.
+        if host.contains(':') {
+            return Err(
+                "bare IPv6 address is ambiguous; wrap it in brackets: \"[ipv6]:port\"".to_string(),
+            );
+        }
         Ok((host, port))
     }
 }
