@@ -1,12 +1,11 @@
 //! buran-php — PHP runtime module (spec section 2.5).
 //!
 //! Modes:
-//! - `--describe`                            module contract, JSON to stdout
-//! - `--prototype --control <fd> --work <fd> --app-config <json>`
-//!                                           boot once, fork warm workers
-//! - `--channel <fd> --work <fd> --app-config <json>`
-//!                                           standalone BWP worker
-//! - `--exec <script.php> [n]`               phase-0 PoC over the embed SAPI
+//! - `--describe` — module contract, JSON to stdout
+//! - `--prototype --control <fd> --work <fd> --app-config <json>` — boot once,
+//!   fork warm workers
+//! - `--channel <fd> --work <fd> --app-config <json>` — standalone BWP worker
+//! - `--exec <script.php> [n]` — phase-0 PoC over the embed SAPI
 
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
@@ -55,6 +54,10 @@ pub struct AppConfig {
     pub user_id: Option<u32>,
     #[serde(default)]
     pub group_id: Option<u32>,
+    /// User name, kept alongside `user_id` so the prototype can call
+    /// initgroups (install the user's own supplementary groups) on drop.
+    #[serde(default)]
+    pub user_name: Option<String>,
     /// Extra executable extensions on top of the intrinsic .php set.
     #[serde(default)]
     pub execute: Vec<String>,

@@ -154,8 +154,8 @@ fn validate_action(
         ));
     }
 
-    if let Some(ApplicationRef::Name(name)) = &action.application {
-        if !applications.contains_key(name) {
+    if let Some(ApplicationRef::Name(name)) = &action.application
+        && !applications.contains_key(name) {
             return Err(ConfigError::invalid(
                 format!("{path}.application"),
                 format!(
@@ -164,16 +164,14 @@ fn validate_action(
                 ),
             ));
         }
-    }
 
-    if let Some(route) = &action.route {
-        if !routes.contains_key(route) {
+    if let Some(route) = &action.route
+        && !routes.contains_key(route) {
             return Err(ConfigError::invalid(
                 format!("{path}.route"),
                 format!("unknown route \"{route}\"; available: {}", available(routes.keys())),
             ));
         }
-    }
 
     if let Some(code) = action.return_ {
         if !(100..=599).contains(&code) {
@@ -194,6 +192,17 @@ fn validate_action(
             "\"location\" is only valid together with \"return\"",
         ));
     }
+
+    // Multiple candidate paths (Unit-style fallback search) are not
+    // implemented: the router silently uses only the first. Reject the array
+    // rather than quietly ignore the rest.
+    if let Some(Share::Full(opts)) = &action.share
+        && opts.share.len() != 1 {
+            return Err(ConfigError::invalid(
+                format!("{path}.share"),
+                "\"share\" takes exactly one path; a list of candidate paths is not supported",
+            ));
+        }
 
     if action.fallback.is_some() && action.share.is_none() {
         return Err(ConfigError::invalid(
@@ -221,7 +230,7 @@ fn validate_application(app: &Application, path: &str) -> Result<(), ConfigError
     }
 
     match app.processes {
-        Processes::Fixed(n) if n == 0 => {
+        Processes::Fixed(0) => {
             return Err(ConfigError::invalid(format!("{path}.processes"), "must be >= 1"))
         }
         Processes::Dynamic { max, spare, .. } => {
@@ -246,6 +255,18 @@ fn validate_application(app: &Application, path: &str) -> Result<(), ConfigError
         return Err(ConfigError::invalid(format!("{path}.queue.max"), "must be >= 1"));
     }
 
+    // task_timeout is the total wall-clock budget; response_timeout is a
+    // shorter client-facing wait inside it. Inverting them is nonsensical.
+    if app.limits.task_timeout < app.limits.response_timeout {
+        return Err(ConfigError::invalid(
+            format!("{path}.limits.task_timeout"),
+            format!(
+                "task_timeout ({}) must be >= response_timeout ({})",
+                app.limits.task_timeout, app.limits.response_timeout
+            ),
+        ));
+    }
+
     for ext in &app.execute {
         if !ext.starts_with('.') || ext.len() < 2 {
             return Err(ConfigError::invalid(
@@ -259,16 +280,53 @@ fn validate_application(app: &Application, path: &str) -> Result<(), ConfigError
 }
 
 fn validate_listener_addr(addr: &str, path: &str) -> Result<(), ConfigError> {
-    let (host, port) = addr
-        .rsplit_once(':')
-        .ok_or_else(|| ConfigError::invalid(path, "listener address must be \"host:port\" or \"*:port\""))?;
-    if host.is_empty() {
-        return Err(ConfigError::invalid(path, "listener host must not be empty (use \"*\" for any)"));
+    parse_listener_addr(addr).map(|_| ()).map_err(|msg| ConfigError::invalid(path, msg))
+}
+
+/// Parse a listener address into a bindable `SocketAddr`. Accepts
+/// `host:port`, `*:port` (any IPv4) and bracketed `[ipv6]:port`. The host
+/// must be an IP literal or `*` — no name resolution. Shared by validation
+/// and the router so `--check-config` can never disagree with the bind.
+pub fn parse_listener_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
+    let (host, port) = split_host_port(addr)?;
+    let port: u16 = port.parse().map_err(|_| format!("\"{port}\" is not a valid port"))?;
+    let ip: std::net::IpAddr = if host == "*" {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        host.parse()
+            .map_err(|_| format!("\"{host}\" is not a valid IP address (use \"[..]\" for IPv6, \"*\" for any)"))?
+    };
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+/// Split a listener address into (host, port), honoring `[ipv6]:port`.
+fn split_host_port(addr: &str) -> Result<(&str, &str), String> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| "missing \"]\" in IPv6 listener address".to_string())?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| "expected \":port\" after \"]\" in IPv6 listener address".to_string())?;
+        Ok((host, port))
+    } else {
+        let (host, port) = addr.rsplit_once(':').ok_or_else(|| {
+            "listener address must be \"host:port\", \"*:port\" or \"[ipv6]:port\"".to_string()
+        })?;
+        if host.is_empty() {
+            return Err("listener host must not be empty (use \"*\" for any)".to_string());
+        }
+        // A colon left in the host means a bare IPv6 literal: the host:port
+        // split is ambiguous (the colons are both address separators and the
+        // port delimiter), so rsplit would silently pick some arbitrary
+        // interpretation. Force brackets instead of guessing.
+        if host.contains(':') {
+            return Err(
+                "bare IPv6 address is ambiguous; wrap it in brackets: \"[ipv6]:port\"".to_string(),
+            );
+        }
+        Ok((host, port))
     }
-    port.parse::<u16>().map_err(|_| {
-        ConfigError::invalid(path, format!("\"{port}\" is not a valid port"))
-    })?;
-    Ok(())
 }
 
 fn available<'a>(keys: impl Iterator<Item = &'a String>) -> String {

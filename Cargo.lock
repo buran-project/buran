@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "buran"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "buran-config",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "buran-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_norway",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "buran-echo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "buran-ipc",
  "buran-worker",
@@ -95,14 +95,14 @@ dependencies = [
 
 [[package]]
 name = "buran-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "buran-php"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "buran-ipc",
  "buran-worker",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "buran-router"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -134,9 +134,10 @@ dependencies = [
 
 [[package]]
 name = "buran-worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "buran-ipc",
+ "rustix",
  "serde_json",
  "thiserror",
 ]

@@ -90,6 +90,11 @@ pub const WS_OP_BINARY: u32 = 2;
 /// Payload: big-endian u16 status code + UTF-8 reason (both optional).
 pub const WS_OP_CLOSE: u32 = 8;
 
+/// Pong status (the `aux` field of a Pong frame): the worker is free.
+pub const PONG_IDLE: u32 = 0;
+/// Pong status: the worker is still busy on the probed task.
+pub const PONG_BUSY: u32 = 1;
+
 #[derive(Debug, Error)]
 pub enum BwpError {
     #[error("frame payload too short: {actual} < {expected}")]

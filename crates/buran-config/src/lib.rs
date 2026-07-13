@@ -10,7 +10,7 @@ mod subst;
 mod validate;
 
 pub use schema::*;
-pub use validate::Validated;
+pub use validate::{parse_listener_addr, Validated};
 
 use thiserror::Error;
 
@@ -59,15 +59,19 @@ fn reject_anchors(yaml: &str) -> Result<(), ConfigError> {
             Some(pos) => &line[..pos],
             None => line,
         };
-        // Quick scan: `&name` / `*name` tokens outside of quoted scalars.
+        // Quick scan: `&name` / `*name` tokens outside of quoted scalars. An
+        // anchor/alias sits at a node position: after whitespace in block
+        // style, or right after a flow indicator (`[`, `{`, `,`, `:`) — the
+        // latter is how `key: [*alias]` slips past a whitespace-only check.
         let mut in_single = false;
         let mut in_double = false;
         let mut prev = ' ';
         for ch in code.chars() {
+            let at_node = prev.is_whitespace() || matches!(prev, '[' | '{' | ',' | ':');
             match ch {
                 '\'' if !in_double => in_single = !in_single,
                 '"' if !in_single => in_double = !in_double,
-                '&' | '*' if !in_single && !in_double && prev.is_whitespace() => {
+                '&' | '*' if !in_single && !in_double && at_node => {
                     return Err(ConfigError::AnchorForbidden { line: i + 1 });
                 }
                 _ => {}
@@ -108,6 +112,47 @@ routes:
     fn unknown_field_is_rejected() {
         let yaml = format!("{VALID}bogus_top_level: 1\n");
         assert!(matches!(err(&yaml), ConfigError::Yaml(_)));
+    }
+
+    #[test]
+    fn task_timeout_below_response_timeout_is_rejected() {
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action: { application: app }
+applications:
+  app:
+    module: test
+    limits:
+      response_timeout: 60
+      task_timeout: 30
+";
+        match err(yaml) {
+            ConfigError::Invalid { path, .. } => {
+                assert!(path.ends_with("limits.task_timeout"), "path: {path}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_limits_defaults_are_ordered() {
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action: { application: app }
+applications:
+  app:
+    module: test
+";
+        let app = from_str(yaml).unwrap().applications.get("app").unwrap().clone();
+        assert_eq!(app.limits.response_timeout, 60);
+        assert_eq!(app.limits.task_timeout, 300);
+        assert!(app.limits.task_timeout >= app.limits.response_timeout);
     }
 
     #[test]
@@ -502,5 +547,147 @@ applications:
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn share_with_multiple_paths_is_rejected() {
+        // Object form with a candidate list: the router only honors the first,
+        // so the array is rejected rather than silently truncated.
+        let yaml = "\
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        share:
+          share: [\"/srv/a$uri\", \"/srv/b$uri\"]
+";
+        match err(yaml) {
+            ConfigError::Invalid { path, .. } => assert_eq!(path, "routes.main[0].action.share"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn share_with_single_path_object_is_accepted() {
+        // Object form carrying exactly one path passes the len() == 1 check.
+        let yaml = "\
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        share:
+          share: \"/srv/www$uri\"
+          index: index.html
+";
+        assert!(from_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn plain_share_path_is_accepted() {
+        // Scalar form (Share::Path) is not an object, so the len check is a
+        // no-op and a single template path is always fine.
+        let yaml = "\
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        share: \"/srv/www$uri\"
+";
+        assert!(from_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn parse_listener_addr_accepts_ipv4_host() {
+        let addr = parse_listener_addr("127.0.0.1:8080").unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn parse_listener_addr_expands_star_to_unspecified_v4() {
+        let addr = parse_listener_addr("*:8080").unwrap();
+        assert!(addr.ip().is_unspecified());
+        assert!(addr.is_ipv4());
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn parse_listener_addr_accepts_bracketed_ipv6() {
+        let addr = parse_listener_addr("[::1]:8080").unwrap();
+        assert!(addr.is_ipv6());
+        assert_eq!(addr.port(), 8080);
+        assert_eq!(addr.ip().to_string(), "::1");
+    }
+
+    #[test]
+    fn parse_listener_addr_accepts_bracketed_ipv6_unspecified() {
+        let addr = parse_listener_addr("[::]:443").unwrap();
+        assert!(addr.ip().is_unspecified());
+        assert!(addr.is_ipv6());
+        assert_eq!(addr.port(), 443);
+    }
+
+    #[test]
+    fn parse_listener_addr_rejects_bare_ipv6() {
+        // A bare IPv6 literal is ambiguous under host:port splitting; brackets
+        // are required. Both a form that would otherwise parse "successfully"
+        // (arbitrarily) and a loopback are rejected.
+        let msg = parse_listener_addr("::1:8080").unwrap_err();
+        assert!(msg.contains("bracket"), "msg: {msg}");
+        assert!(parse_listener_addr("2001:db8::1:8080").is_err());
+        assert!(parse_listener_addr("fe80::1").is_err());
+    }
+
+    #[test]
+    fn parse_listener_addr_rejects_missing_closing_bracket() {
+        let msg = parse_listener_addr("[::1:8080").unwrap_err();
+        assert!(msg.contains(']'), "msg: {msg}");
+    }
+
+    #[test]
+    fn parse_listener_addr_rejects_missing_port_after_bracket() {
+        assert!(parse_listener_addr("[::1]").is_err());
+        assert!(parse_listener_addr("[::1]8080").is_err());
+    }
+
+    #[test]
+    fn parse_listener_addr_rejects_bad_port() {
+        assert!(parse_listener_addr("127.0.0.1:notaport").is_err());
+        assert!(parse_listener_addr("127.0.0.1:70000").is_err()); // > u16::MAX
+    }
+
+    #[test]
+    fn parse_listener_addr_rejects_empty_host() {
+        assert!(parse_listener_addr(":8080").is_err());
+    }
+
+    #[test]
+    fn parse_listener_addr_rejects_non_ip_host() {
+        // No name resolution: a hostname is not a valid listener host.
+        assert!(parse_listener_addr("localhost:8080").is_err());
+    }
+
+    #[test]
+    fn parse_listener_addr_rejects_missing_port_separator() {
+        assert!(parse_listener_addr("8080").is_err());
+    }
+
+    #[test]
+    fn ipv6_listener_validates_end_to_end() {
+        let yaml = "\
+listeners:
+  \"[::1]:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        return: 200
+";
+        assert!(from_str(yaml).is_ok());
     }
 }

@@ -31,6 +31,10 @@ pub struct AppConfig {
     pub user_id: Option<u32>,
     #[serde(default)]
     pub group_id: Option<u32>,
+    /// User name, kept alongside `user_id` so the prototype can call
+    /// initgroups (install the user's own supplementary groups) on drop.
+    #[serde(default)]
+    pub user_name: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -82,7 +86,7 @@ fn main() -> ExitCode {
             // contract and owned exclusively by this process.
             let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
             let work = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(work_fd) };
-            match worker::serve(work, stream, &app) {
+            match worker::serve(work, stream, &app, 0) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("buran-echo: {e}");

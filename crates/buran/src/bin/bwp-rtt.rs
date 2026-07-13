@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use buran_ipc::{FrameHeader, FrameKind, RequestBuilder, BWP_VERSION, FRAME_HEADER_LEN};
+use buran_ipc::{FrameHeader, FrameKind, HelloAck, RequestBuilder, BWP_VERSION, FRAME_HEADER_LEN};
 
 const CHANNEL_FD: i32 = 3;
 const WORK_FD: i32 = 4;
@@ -38,16 +38,13 @@ fn main() -> ExitCode {
         cmd.arg("--channel").arg(CHANNEL_FD.to_string());
         cmd.arg("--work").arg(WORK_FD.to_string());
         cmd.args(&extra_args);
-        // Safety: dup2 in pre_exec is async-signal-safe; it also clears
-        // CLOEXEC on the target fds so the child inherits both channels.
+        // Safety: dup2/fcntl in pre_exec are async-signal-safe; `install_fd`
+        // moves each fd to its well-known number and clears CLOEXEC so the
+        // child inherits both channels.
         unsafe {
             cmd.pre_exec(move || {
-                if libc_dup2(theirs_fd, CHANNEL_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc_dup2(work_theirs_fd, WORK_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                install_fd(theirs_fd, CHANNEL_FD)?;
+                install_fd(work_theirs_fd, WORK_FD)?;
                 Ok(())
             });
         }
@@ -60,8 +57,9 @@ fn main() -> ExitCode {
     let (hello, payload) = read_frame(&mut ours);
     assert_eq!(hello.kind, FrameKind::Hello, "expected Hello");
     assert_eq!(&payload[..4], buran_ipc::BWP_MAGIC, "bad magic");
-    let ack = u32::to_le_bytes(BWP_VERSION);
-    write_frame(&mut ours, &FrameHeader::new(FrameKind::HelloAck, 0, 4), &ack);
+    // Grant concurrency 1: blocking profile, one in-flight request per worker.
+    let ack = HelloAck { version: BWP_VERSION, concurrency: 1 }.encode();
+    write_frame(&mut ours, &FrameHeader::new(FrameKind::HelloAck, 0, ack.len() as u32), &ack);
 
     // Pre-build one request payload (typical small GET).
     let mut builder = RequestBuilder::new();
@@ -166,9 +164,26 @@ fn read_frame(stream: &mut UnixStream) -> (FrameHeader, Vec<u8>) {
     let mut head = [0u8; FRAME_HEADER_LEN];
     stream.read_exact(&mut head).expect("read header");
     let header = FrameHeader::decode(&head).expect("decode header");
-    let mut payload = vec![0u8; header.payload_len as usize];
-    stream.read_exact(&mut payload).expect("read payload");
+    // Grow with the data rather than trusting payload_len up front.
+    let want = u64::from(header.payload_len);
+    let mut payload = Vec::new();
+    let read = (&mut *stream).take(want).read_to_end(&mut payload).expect("read payload");
+    assert_eq!(read as u64, want, "short frame payload");
     (header, payload)
+}
+
+/// Move `old` onto `new` for the child, CLOEXEC cleared. Async-signal-safe.
+/// `dup2` with `old == new` is a no-op that leaves CLOEXEC set (the fd would
+/// close on exec), so clear it explicitly in that case.
+fn install_fd(old: i32, new: i32) -> std::io::Result<()> {
+    if old == new {
+        if libc_fcntl_setfd(new, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else if libc_dup2(old, new) < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn libc_dup2(old: i32, new: i32) -> i32 {
@@ -177,6 +192,15 @@ fn libc_dup2(old: i32, new: i32) -> i32 {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
     unsafe { dup2(old, new) }
+}
+
+/// `fcntl(fd, F_SETFD, flags)`; clears FD_CLOEXEC with flags 0.
+fn libc_fcntl_setfd(fd: i32, flags: i32) -> i32 {
+    const F_SETFD: i32 = 2;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    unsafe { fcntl(fd, F_SETFD, flags) }
 }
 
 fn drop_fd(fd: i32) {

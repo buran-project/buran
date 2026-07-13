@@ -37,6 +37,9 @@ pub enum Action {
         index: String,
         /// MIME filter: file is served only if its type matches.
         types: Option<PatternSet>,
+        /// Follow symlinks during resolution (default true). When false,
+        /// paths resolving through a symlink are refused.
+        follow_symlinks: bool,
         /// Opt-out of module source-leak protection.
         serve_sources: bool,
         /// Per-app `execute` extensions of the fallback application
@@ -54,6 +57,7 @@ pub enum Decision<'r> {
         template: &'r str,
         index: &'r str,
         types: Option<&'r PatternSet>,
+        follow_symlinks: bool,
         serve_sources: bool,
         extra_source_exts: &'r [String],
         fallback: Option<&'r Action>,
@@ -162,8 +166,8 @@ fn compile_action(
         return Ok(Action::Route { name: route.clone() });
     }
     if let Some(share) = &action.share {
-        let (template, index, types, serve_sources) = match share {
-            Share::Path(p) => (p.clone(), "index.html".to_string(), None, false),
+        let (template, index, types, follow_symlinks, serve_sources) = match share {
+            Share::Path(p) => (p.clone(), "index.html".to_string(), None, true, false),
             Share::Full(opts) => (
                 opts.share.iter().next().cloned().unwrap_or_default(),
                 opts.index.clone().unwrap_or_else(|| "index.html".to_string()),
@@ -171,6 +175,7 @@ fn compile_action(
                     .as_ref()
                     .map(|t| PatternSet::compile(t.iter().map(String::as_str), true))
                     .transpose()?,
+                opts.follow_symlinks.unwrap_or(true),
                 opts.serve_sources,
             ),
         };
@@ -193,7 +198,15 @@ fn compile_action(
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        return Ok(Action::Share { template, index, types, serve_sources, extra_source_exts, fallback });
+        return Ok(Action::Share {
+            template,
+            index,
+            types,
+            follow_symlinks,
+            serve_sources,
+            extra_source_exts,
+            fallback,
+        });
     }
     if let Some(status) = action.return_ {
         return Ok(Action::Return { status, location: action.location.clone() });
@@ -250,16 +263,23 @@ impl CompiledRoutes {
                     continue;
                 }
                 Action::Application { name } => Decision::Application(name),
-                Action::Share { template, index, types, serve_sources, extra_source_exts, fallback } => {
-                    Decision::Share {
-                        template,
-                        index,
-                        types: types.as_ref(),
-                        serve_sources: *serve_sources,
-                        extra_source_exts,
-                        fallback: fallback.as_deref(),
-                    }
-                }
+                Action::Share {
+                    template,
+                    index,
+                    types,
+                    follow_symlinks,
+                    serve_sources,
+                    extra_source_exts,
+                    fallback,
+                } => Decision::Share {
+                    template,
+                    index,
+                    types: types.as_ref(),
+                    follow_symlinks: *follow_symlinks,
+                    serve_sources: *serve_sources,
+                    extra_source_exts,
+                    fallback: fallback.as_deref(),
+                },
                 Action::Return { status, location } => {
                     Decision::Return { status: *status, location: location.as_deref() }
                 }
@@ -284,31 +304,37 @@ impl Step {
     fn matches(&self, meta: &RequestMeta<'_>, path: &[u8], query: &[u8]) -> bool {
         let Some(m) = &self.matcher else { return true };
 
-        if let Some(set) = &m.method {
-            if !set.matches(meta.method, false) {
+        if let Some(set) = &m.method
+            && !set.matches(meta.method, false) {
                 return false;
             }
-        }
         if let Some(set) = &m.host {
-            // Host header may carry a port: match on the name part.
-            let host = match memchr::memchr(b':', meta.host) {
-                Some(pos) => &meta.host[..pos],
-                None => meta.host,
+            // Host header may carry a port: match on the name part. A bracketed
+            // IPv6 literal (`[::1]:8080`) keeps its colons inside the brackets,
+            // so strip the port after `]`; otherwise split on the first colon.
+            let host = if meta.host.first() == Some(&b'[') {
+                match memchr::memchr(b']', meta.host) {
+                    Some(pos) => &meta.host[..=pos],
+                    None => meta.host,
+                }
+            } else {
+                match memchr::memchr(b':', meta.host) {
+                    Some(pos) => &meta.host[..pos],
+                    None => meta.host,
+                }
             };
             if !set.matches(host, true) {
                 return false;
             }
         }
-        if let Some(set) = &m.uri {
-            if !set.matches(path, false) {
+        if let Some(set) = &m.uri
+            && !set.matches(path, false) {
                 return false;
             }
-        }
-        if let Some(set) = &m.query {
-            if !set.matches(query, false) {
+        if let Some(set) = &m.query
+            && !set.matches(query, false) {
                 return false;
             }
-        }
         for (name, set) in &m.headers {
             let value = meta
                 .headers
@@ -333,11 +359,10 @@ impl Step {
                 }
             }
         }
-        if let Some(cidr) = &m.source {
-            if !cidr.matches(meta.remote) {
+        if let Some(cidr) = &m.source
+            && !cidr.matches(meta.remote) {
                 return false;
             }
-        }
         true
     }
 }
@@ -373,9 +398,13 @@ mod tests {
     }
 
     fn meta<'a>(path: &'a [u8], query: &'a [u8]) -> RequestMeta<'a> {
+        meta_host(b"example.test", path, query)
+    }
+
+    fn meta_host<'a>(host: &'a [u8], path: &'a [u8], query: &'a [u8]) -> RequestMeta<'a> {
         RequestMeta {
             method: b"GET",
-            host: b"example.test",
+            host,
             path,
             query,
             headers: &[],
@@ -534,6 +563,56 @@ routes:
         );
         // Self-jump must terminate via the hop limit, not spin forever.
         assert!(matches!(routes.decide("main", &meta(b"/x", b"")).decision, Decision::NotFound));
+    }
+
+    #[test]
+    fn host_matcher_strips_port() {
+        let routes = compiled(
+            "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - match: { host: \"example.test\" }
+      action: { return: 200 }
+    - action: { return: 404 }
+",
+        );
+        let hit = |host: &[u8]| {
+            matches!(
+                routes.decide("main", &meta_host(host, b"/", b"")).decision,
+                Decision::Return { status: 200, .. }
+            )
+        };
+        assert!(hit(b"example.test"));
+        assert!(hit(b"example.test:8080"), "a port must not defeat the host match");
+        assert!(!hit(b"other.test:8080"));
+    }
+
+    #[test]
+    fn host_matcher_handles_bracketed_ipv6() {
+        // The port sits after `]`, so an IPv6 authority must match on the
+        // bracketed literal, not get truncated at the first inner colon.
+        let routes = compiled(
+            "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - match: { host: \"[::1]\" }
+      action: { return: 200 }
+    - action: { return: 404 }
+",
+        );
+        let hit = |host: &[u8]| {
+            matches!(
+                routes.decide("main", &meta_host(host, b"/", b"")).decision,
+                Decision::Return { status: 200, .. }
+            )
+        };
+        assert!(hit(b"[::1]"));
+        assert!(hit(b"[::1]:8080"), "the port after ] must be stripped");
+        assert!(!hit(b"[::2]:8080"));
     }
 
     #[test]

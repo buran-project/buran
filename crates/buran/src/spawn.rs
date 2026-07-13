@@ -5,7 +5,7 @@
 //! command. The supervisor talks to the prototype over a control channel:
 //! one byte per spawn, the worker fd attached via SCM_RIGHTS.
 
-use std::io::IoSlice;
+use std::io::{IoSlice, Write};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixDatagram, UnixStream as StdUnixStream};
 use std::os::unix::process::CommandExt;
@@ -15,48 +15,60 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use buran_config::Application;
-use buran_router::Spawner;
+use buran_router::{Spawn, Spawner};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use tracing::{info, warn};
 
 const CONTROL_FD: i32 = 3;
 const WORK_FD: i32 = 4;
 
+/// Resolved privilege-drop identity for an application.
+#[derive(Default)]
+struct DropIds {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    /// User name, forwarded so the prototype can call initgroups.
+    user_name: Option<String>,
+}
+
 /// Resolve `user`/`group` names to numeric ids at startup (fail fast: a
 /// typo in a username must not surface as a prototype crash loop).
-fn resolve_ids(app: &Application) -> anyhow::Result<(Option<u32>, Option<u32>)> {
-    let uid = app
+fn resolve_ids(app: &Application) -> anyhow::Result<DropIds> {
+    let user = app
         .user
         .as_deref()
-        .map(|name| {
-            nix::unistd::User::from_name(name)
-                .ok()
-                .flatten()
-                .map(|u| u.uid.as_raw())
-                .ok_or_else(|| anyhow::anyhow!("unknown user \"{name}\""))
+        .map(|name| match nix::unistd::User::from_name(name) {
+            Ok(Some(u)) => Ok(u),
+            Ok(None) => Err(anyhow::anyhow!("unknown user \"{name}\"")),
+            // A lookup error (EIO / NSS down) must not read as "no such user".
+            Err(e) => Err(anyhow::anyhow!("looking up user \"{name}\": {e}")),
         })
         .transpose()?;
-    let gid = app
+    let explicit_gid = app
         .group
         .as_deref()
-        .map(|name| {
-            nix::unistd::Group::from_name(name)
-                .ok()
-                .flatten()
-                .map(|g| g.gid.as_raw())
-                .ok_or_else(|| anyhow::anyhow!("unknown group \"{name}\""))
+        .map(|name| match nix::unistd::Group::from_name(name) {
+            Ok(Some(g)) => Ok(g.gid.as_raw()),
+            Ok(None) => Err(anyhow::anyhow!("unknown group \"{name}\"")),
+            Err(e) => Err(anyhow::anyhow!("looking up group \"{name}\": {e}")),
         })
         .transpose()?;
+
+    // When only `user` is set, fall back to that user's primary group so the
+    // gid is dropped too; otherwise the worker would keep buran's gid.
+    let gid = explicit_gid.or_else(|| user.as_ref().map(|u| u.gid.as_raw()));
+    let uid = user.as_ref().map(|u| u.uid.as_raw());
+    let user_name = user.map(|u| u.name);
 
     if (uid.is_some() || gid.is_some()) && !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!("application user/group is set but buran is not running as root");
     }
-    Ok((uid, gid))
+    Ok(DropIds { uid, gid, user_name })
 }
 
 /// JSON slice of the application config owned by the module (spec 2.4:
 /// main validates the common part, the module knows its own fields).
-fn module_app_config(app: &Application, uid: Option<u32>, gid: Option<u32>) -> String {
+fn module_app_config(app: &Application, ids: &DropIds) -> String {
     let ini_file = app
         .options
         .as_ref()
@@ -98,8 +110,9 @@ fn module_app_config(app: &Application, uid: Option<u32>, gid: Option<u32>) -> S
         "admin": ini_map("admin"),
         "user": ini_map("user"),
         "max_requests": app.limits.requests,
-        "user_id": uid,
-        "group_id": gid,
+        "user_id": ids.uid,
+        "group_id": ids.gid,
+        "user_name": ids.user_name,
         "execute": app.execute,
     })
     .to_string()
@@ -125,6 +138,12 @@ struct PrototypeSpawner {
     module_binary: PathBuf,
     app_config: String,
     prototype: Mutex<Option<Prototype>>,
+    /// Per-application environment overlaid on the inherited environment
+    /// (config `environment:`). Workers inherit it via fork.
+    env: Vec<(String, String)>,
+    /// Working directory pinned for the prototype and its workers (config
+    /// `working_directory:`); `None` leaves buran's cwd in place.
+    working_dir: Option<PathBuf>,
     /// Worker end of the shared work socket. Held here so the queue (and
     /// any datagrams in flight) survives a prototype restart.
     work_worker_end: OwnedFd,
@@ -181,17 +200,21 @@ impl PrototypeSpawner {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        // Safety: dup2 is async-signal-safe; it clears CLOEXEC on the
-        // target fds so the child inherits exactly the control channel and
-        // the shared work socket.
+        // Per-application env is overlaid on the inherited environment; the
+        // working directory, when set, is pinned before exec. Both propagate
+        // to workers through fork.
+        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
+        if let Some(dir) = &self.working_dir {
+            cmd.current_dir(dir);
+        }
+
+        // Safety: dup2/fcntl are async-signal-safe; `install_fd` moves each
+        // inherited fd to its well-known number and clears CLOEXEC so the
+        // child keeps exactly the control channel and the shared work socket.
         unsafe {
             cmd.pre_exec(move || {
-                if libc_dup2(theirs_fd, CONTROL_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc_dup2(work_fd, WORK_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                install_fd(theirs_fd, CONTROL_FD)?;
+                install_fd(work_fd, WORK_FD)?;
                 Ok(())
             });
         }
@@ -213,6 +236,23 @@ impl PrototypeSpawner {
     }
 }
 
+impl Spawn for PrototypeSpawner {
+    fn spawn(&self) -> anyhow::Result<tokio::net::UnixStream> {
+        self.spawn_worker()
+    }
+
+    fn kill(&self, token: u64) {
+        // Best-effort: if the prototype is down there is nothing to kill (its
+        // workers died with it). The command reaches the worker's parent, which
+        // SIGKILLs by the pid it forked — pid-reuse safe.
+        let guard = self.prototype.lock().expect("prototype lock");
+        if let Some(proto) = guard.as_ref()
+            && let Err(e) = send_kill(&proto.control, token) {
+                warn!(app = %self.app_name, "kill worker token {token}: {e}");
+            }
+    }
+}
+
 /// Route application output into the error log, line by line, tagged with
 /// the application name. One blocking thread per pipe, alive as long as
 /// the prototype (workers inherit the same pipe via fork).
@@ -229,9 +269,13 @@ fn forward_output(app: String, channel: &'static str, pipe: impl std::io::Read +
     });
 }
 
-/// One spawn command: a single byte with the worker fd attached.
+// Control protocol command bytes (must match the prototype).
+const CMD_SPAWN: u8 = 1;
+const CMD_KILL: u8 = 2;
+
+/// One spawn command: the CMD_SPAWN byte with the worker fd attached.
 fn send_fd(control: &StdUnixStream, fd: i32) -> std::io::Result<()> {
-    let data = [1u8];
+    let data = [CMD_SPAWN];
     let iov = [IoSlice::new(&data)];
     let fds = [fd];
     let cmsg = [ControlMessage::ScmRights(&fds)];
@@ -240,25 +284,53 @@ fn send_fd(control: &StdUnixStream, fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Returns the spawner plus the router end of the shared work socket
-/// (the kernel-arbitrated request queue of this application).
+/// One kill command: the CMD_KILL byte followed by the 8-byte worker token.
+fn send_kill(control: &StdUnixStream, token: u64) -> std::io::Result<()> {
+    let mut msg = [0u8; 9];
+    msg[0] = CMD_KILL;
+    msg[1..9].copy_from_slice(&token.to_le_bytes());
+    (&mut &*control).write_all(&msg)
+}
+
+/// Returns the spawner, the router end of the shared work socket (the
+/// kernel-arbitrated request queue of this application), and the uid the
+/// workers drop to (if any) — the router chowns spilled request bodies to it
+/// so a worker under a different user can still open them.
 pub fn make_spawner(
     app_name: &str,
     module_binary: PathBuf,
     app: &Application,
-) -> anyhow::Result<(Spawner, UnixDatagram)> {
-    let (uid, gid) = resolve_ids(app).with_context(|| format!("application {app_name}"))?;
+) -> anyhow::Result<(Spawner, UnixDatagram, Option<u32>)> {
+    let ids = resolve_ids(app).with_context(|| format!("application {app_name}"))?;
+    let worker_uid = ids.uid;
 
     let (router_end, worker_end) = UnixDatagram::pair().context("work socketpair")?;
 
     let spawner = Arc::new(PrototypeSpawner {
         app_name: app_name.to_string(),
         module_binary,
-        app_config: module_app_config(app, uid, gid),
+        app_config: module_app_config(app, &ids),
         prototype: Mutex::new(None),
+        env: app.environment.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        working_dir: app.working_directory.as_ref().map(PathBuf::from),
         work_worker_end: OwnedFd::from(worker_end),
     });
-    Ok((Arc::new(move || spawner.spawn_worker()), router_end))
+    Ok((spawner, router_end, worker_uid))
+}
+
+/// Move `old` onto the well-known `new` fd for the child, CLOEXEC cleared.
+/// Async-signal-safe (only dup2/fcntl). When `old == new`, `dup2` is a no-op
+/// that does NOT clear CLOEXEC, so the fd would close on exec — clear it
+/// explicitly instead.
+fn install_fd(old: i32, new: i32) -> std::io::Result<()> {
+    if old == new {
+        if libc_fcntl_setfd(new, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else if libc_dup2(old, new) < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn libc_dup2(old: i32, new: i32) -> i32 {
@@ -266,6 +338,15 @@ fn libc_dup2(old: i32, new: i32) -> i32 {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
     }
     unsafe { dup2(old, new) }
+}
+
+/// `fcntl(fd, F_SETFD, flags)`; used to clear FD_CLOEXEC (flags 0).
+fn libc_fcntl_setfd(fd: i32, flags: i32) -> i32 {
+    const F_SETFD: i32 = 2;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    unsafe { fcntl(fd, F_SETFD, flags) }
 }
 
 fn libc_close(fd: i32) {
@@ -280,6 +361,44 @@ fn libc_close(fd: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fcntl(fd, F_GETFD)`; returns the fd flags (FD_CLOEXEC is bit 0).
+    fn fd_flags(fd: i32) -> i32 {
+        const F_GETFD: i32 = 1;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        unsafe { fcntl(fd, F_GETFD) }
+    }
+
+    const FD_CLOEXEC: i32 = 1;
+
+    #[test]
+    fn install_fd_clears_cloexec_when_fd_already_in_place() {
+        // The dup2(fd, fd) no-op would leave CLOEXEC set and the fd would close
+        // on exec — install_fd must clear it explicitly. Rust sets CLOEXEC on
+        // sockets it creates, so this is exactly the at-risk case.
+        let (a, _b) = StdUnixStream::pair().unwrap();
+        let fd = a.as_raw_fd();
+        assert_ne!(fd_flags(fd) & FD_CLOEXEC, 0, "precondition: CLOEXEC set");
+
+        install_fd(fd, fd).unwrap();
+        assert_eq!(fd_flags(fd) & FD_CLOEXEC, 0, "CLOEXEC must be cleared");
+    }
+
+    #[test]
+    fn install_fd_moves_fd_and_clears_cloexec() {
+        // old != new: dup2 replaces `new` with a CLOEXEC-free dup of `old`.
+        let (src, _s) = StdUnixStream::pair().unwrap();
+        let (dst, _d) = StdUnixStream::pair().unwrap();
+        let (old, new) = (src.as_raw_fd(), dst.as_raw_fd());
+        assert_ne!(old, new);
+
+        install_fd(old, new).unwrap();
+        // `new` now aliases src's description with CLOEXEC cleared; `dst` still
+        // owns the number and closes it on drop.
+        assert_eq!(fd_flags(new) & FD_CLOEXEC, 0, "CLOEXEC must be cleared on the target");
+    }
 
     fn scalar(yaml: &str) -> serde_norway::Value {
         serde_norway::from_str(yaml).unwrap()
@@ -327,8 +446,13 @@ applications:
 ",
         );
 
+        let ids = DropIds {
+            uid: Some(1000),
+            gid: Some(33),
+            user_name: Some("www-data".to_string()),
+        };
         let json: serde_json::Value =
-            serde_json::from_str(&module_app_config(&app, Some(1000), Some(33))).unwrap();
+            serde_json::from_str(&module_app_config(&app, &ids)).unwrap();
 
         // Relative root is absolutized against the cwd.
         let root = json["root"].as_str().unwrap();
@@ -343,6 +467,7 @@ applications:
         assert_eq!(json["max_requests"], 0);
         assert_eq!(json["user_id"], 1000);
         assert_eq!(json["group_id"], 33);
+        assert_eq!(json["user_name"], "www-data");
         assert_eq!(json["execute"][0], ".html");
     }
 
@@ -361,7 +486,7 @@ applications:
 ",
         );
         let json: serde_json::Value =
-            serde_json::from_str(&module_app_config(&app, None, None)).unwrap();
+            serde_json::from_str(&module_app_config(&app, &DropIds::default())).unwrap();
         assert_eq!(json["root"], "");
         assert!(json["script"].is_null());
         assert!(json["ini_file"].is_null());
@@ -384,6 +509,7 @@ applications:
     module: php85
 ",
         );
-        assert_eq!(resolve_ids(&app).unwrap(), (None, None));
+        let ids = resolve_ids(&app).unwrap();
+        assert_eq!((ids.uid, ids.gid, ids.user_name), (None, None, None));
     }
 }

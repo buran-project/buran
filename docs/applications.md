@@ -111,14 +111,24 @@ Per-request safety limits:
 
 ```yaml
 limits:
-  timeout: 30    # seconds a worker may spend on one request before SIGKILL + respawn
-  requests: 500  # recycle the worker after N requests (0 = never); default 0
+  response_timeout: 60   # seconds the router waits for worker output while a client waits; default 60
+  task_timeout: 300      # seconds a worker may spend on one task total (incl. background); default 300
+  requests: 500          # recycle the worker after N requests (0 = never); default 0
 ```
 
-`requests` mirrors php-fpm's `pm.max_requests`: after the N-th response the
-worker exits cleanly and the pool replaces it, which caps the impact of slow
-memory leaks. `timeout` is the hard runaway guard — the worker is killed and
-respawned; unconsumed requests stay queued for other workers.
+- `response_timeout` — how long the router waits for the worker's next output
+  while a client is attached (like nginx `fastcgi_read_timeout`). Exceeded: the
+  client gets `504` and the worker is told to abort — but the worker is **not**
+  killed.
+- `task_timeout` — the total wall-clock a worker may spend on one task, counting
+  background work after `fastcgi_finish_request` (like php-fpm
+  `request_terminate_timeout`, but wall-clock and background-inclusive). Exceeded:
+  the task is aborted; the worker is killed only if it refuses to wind down. Must
+  be `>= response_timeout`. Set it above the script's `max_execution_time` so PHP
+  bails a CPU runaway itself first (its timer counts CPU time, not sleep/IO, so it
+  cannot bound background jobs — `task_timeout` is the real wall-clock backstop).
+- `requests` mirrors php-fpm's `pm.max_requests`: after the N-th response the
+  worker exits cleanly and the pool replaces it, capping the impact of slow leaks.
 
 ## The PHP module
 
@@ -165,6 +175,73 @@ RUN docker-php-ext-install -j"$(nproc)" pdo_mysql
 The generated INI lands in the scan dir and the Buran SAPI picks it up like any
 other PHP.
 
+### Response framing & streaming (SSE, progressive output)
+
+Buran follows the **canonical Apache/mod_php contract** here — the script
+controls framing, not the server:
+
+- **No `flush()` — buffered.** The response is collected until the script
+  returns and sent with an exact `Content-Length`, in one shot. This is the
+  common case (a rendered page, a JSON payload).
+- **`flush()` (or `ob_flush()` + `flush()`) — streamed.** The flush pushes
+  whatever has been written so far to the client immediately; the router
+  switches that response to chunked transfer and forwards every subsequent
+  write as it arrives. This is what Server-Sent Events, long-polling and
+  progressive rendering need — and it means `flush()` deliberately gives up
+  `Content-Length`, exactly as it does under Apache.
+- **Oversized buffered responses.** A response that grows past **256 KiB**
+  without a `flush()` is streamed chunked rather than held whole in memory —
+  the same way Apache's core output filter flushes on a full buffer. Below the
+  threshold you always get `Content-Length`.
+
+nginx + php-fpm differs: it re-buffers the FastCGI response and by default
+absorbs the script's `flush()`, so the client framing is nginx's decision, not
+the app's. Buran stays with the older, more predictable PHP semantics.
+
+```php
+header('Content-Type: text/event-stream');
+while (true) {
+    echo "data: " . time() . "\n\n";
+    flush();               // delivered to the client now
+    sleep(1);
+}
+```
+
+Client disconnects surface as a normal **PHP connection abort**, so the usual
+controls apply:
+
+- By default (`ignore_user_abort(false)`) the script is aborted when the client
+  goes away — `register_shutdown_function` still runs.
+- With `ignore_user_abort(true)` the script keeps running after a disconnect
+  (e.g. to finish a write), and `connection_aborted()` returns `1`.
+
+A streaming response with no output for longer than `settings.http.idle_timeout`
+is closed and the worker released.
+
+> **Pool sizing.** In the blocking model a streaming request occupies its
+> worker for the whole time it streams — exactly like php-fpm. A pool of *N*
+> workers serves at most *N* concurrent streams, so size `processes` for the
+> expected number of long-lived connections (SSE especially).
+
+### Behavior notes
+
+A few intentional behaviors worth knowing about:
+
+- **`php_sapi_name()` returns `cli-server`.** The Buran SAPI reports the name
+  `cli-server` (it lets opcache's SAPI whitelist accept the runtime). Apps or
+  libraries that branch on the SAPI name — some frameworks special-case PHP's
+  built-in dev server — will see `cli-server`, not `fpm-fcgi`.
+- **Directory redirects are `http://`.** A request for a directory without a
+  trailing slash gets a `301` to `http://<Host>/…`. Behind a TLS terminator
+  this is an `https → http` downgrade in the `Location`. For now, avoid relying
+  on directory-redirects behind TLS (link to the trailing-slash form
+  directly); `X-Forwarded-Proto` awareness is planned.
+- **`max_execution_time` is CPU time, not wall-clock.** It does not count
+  `sleep()`/IO, so it cannot bound a background job — that is what
+  `limits.task_timeout` is for (see [limits](#limits)). Set
+  `max_execution_time` below `limits.task_timeout` so PHP kills a CPU runaway
+  cleanly first.
+
 ## How modules work (BWP)
 
 Runtime modules communicate with the router over the **Buran Worker Protocol
@@ -186,6 +263,10 @@ Key points:
   implement BWP natively and can go higher.
 - Crash isolation: a datagram not yet consumed survives a worker death and is
   served by the remaining workers; only the request in flight fails.
+- Streaming: a worker sends a `Flush` frame to make the router forward buffered
+  output immediately (chunked). When a client disconnects, the router sends an
+  `Abort` frame for that request; the blocking SDK surfaces it as a failed
+  write from `send_body`/`flush` so the runtime can abort (PHP user-abort).
 
 Two reference implementations live in the tree:
 

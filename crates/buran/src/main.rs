@@ -192,8 +192,8 @@ fn serve(
     let mut spawners = std::collections::BTreeMap::new();
     for (name, app) in &validated.applications {
         let binary = modules_dir.join(format!("buran-{}", app.module));
-        let (spawner, work) = spawn::make_spawner(name, binary, app)?;
-        spawners.insert(name.clone(), (spawner, work));
+        let (spawner, work, worker_uid) = spawn::make_spawner(name, binary, app)?;
+        spawners.insert(name.clone(), (spawner, work, worker_uid));
     }
 
     runtime.block_on(async {
@@ -227,8 +227,9 @@ fn serve(
 
 /// As PID 1 in a container, adopted orphans (e.g. workers outliving their
 /// prototype) reparent to us; collect them so they do not stay zombies.
-/// Statuses of direct children are also consumed by their per-child wait()
-/// threads — whoever reaps first wins, the loser gets ECHILD and moves on.
+/// Direct-child prototypes may also be reaped by their explicit `wait()` on
+/// restart in the spawner — whoever reaps first wins, the loser gets ECHILD
+/// and moves on.
 fn reap_orphans_as_pid1() {
     if std::process::id() != 1 {
         return;

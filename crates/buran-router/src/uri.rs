@@ -29,13 +29,12 @@ pub fn percent_decode(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            if let (Some(hi), Some(lo)) = (hex(input[i + 1]), hex(input[i + 2])) {
+        if input[i] == b'%' && i + 2 < input.len()
+            && let (Some(hi), Some(lo)) = (hex(input[i + 1]), hex(input[i + 2])) {
                 out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
-        }
         out.push(input[i]);
         i += 1;
     }

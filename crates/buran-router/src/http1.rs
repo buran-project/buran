@@ -23,7 +23,23 @@ use crate::{AppState, ListenerKind};
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_HEADERS: usize = 64;
-pub(crate) const SERVER: &str = concat!("buran/", env!("CARGO_PKG_VERSION"));
+/// Full server token including the version.
+pub(crate) const SERVER_FULL: &str = concat!("buran/", env!("CARGO_PKG_VERSION"));
+
+/// Process-global `Server:` header value, fixed once at router startup from
+/// settings.http.server_version. Defaults to the versioned token so unit
+/// tests and standalone callers keep the historical behaviour.
+static SERVER_HEADER: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Called once by `Router::new`. `false` suppresses the version, exposing
+/// only `buran` in the `Server:` header.
+pub(crate) fn init_server_header(with_version: bool) {
+    let _ = SERVER_HEADER.set(if with_version { SERVER_FULL } else { "buran" });
+}
+
+pub(crate) fn server_header() -> &'static str {
+    SERVER_HEADER.get().copied().unwrap_or(SERVER_FULL)
+}
 
 /// AsyncWrite passthrough counting wire bytes for the access log.
 struct CountingWriter<W> {
@@ -277,12 +293,13 @@ pub async fn serve_connection(
                 } else {
                     let mut apps = String::new();
                     for (i, (name, pool)) in state.pools.iter().enumerate() {
-                        let (active, idle, queued) = pool.stats();
+                        let s = pool.stats();
                         if i > 0 {
                             apps.push(',');
                         }
                         apps.push_str(&format!(
-                            "\"{name}\":{{\"workers\":{active},\"idle\":{idle},\"queued\":{queued}}}"
+                            "\"{name}\":{{\"workers\":{},\"idle\":{},\"queued\":{}}}",
+                            s.workers, s.idle, s.queued
                         ));
                     }
                     format!("{{\"status\":\"ok\",\"applications\":{{{apps}}}}}\n")
@@ -305,12 +322,21 @@ pub async fn serve_connection(
                         write_return(&mut wr, status, location, keep_alive).await?;
                         status
                     }
-                    Decision::Share { template, index, types, serve_sources, extra_source_exts, fallback } => {
+                    Decision::Share {
+                        template,
+                        index,
+                        types,
+                        follow_symlinks,
+                        serve_sources,
+                        extra_source_exts,
+                        fallback,
+                    } => {
                         let static_ctx = serve_static::StaticContext {
                             types,
                             mime_overrides: &state.mime_overrides,
                             source_exts: &state.source_exts,
                             extra_source_exts,
+                            follow_symlinks,
                             serve_sources,
                             req_headers: &parsed.headers,
                             head_only: parsed.method == b"HEAD",
@@ -452,30 +478,45 @@ fn parse_request(head: &[u8]) -> Option<Parsed> {
         bad: None,
     };
 
+    let mut cl_seen = false;
+    let mut host_count = 0u32;
     for h in req.headers.iter() {
         let name = h.name.to_ascii_lowercase().into_bytes();
         match name.as_slice() {
+            b"host" => host_count += 1,
             b"content-length" => {
-                parsed.content_length = std::str::from_utf8(h.value)
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(u64::MAX);
-                if parsed.content_length == u64::MAX {
-                    parsed.bad = Some(400);
+                match std::str::from_utf8(h.value).ok().and_then(|v| v.parse::<u64>().ok()) {
+                    // Conflicting duplicate Content-Length: reject rather than
+                    // let last-wins disagree with an upstream proxy (RFC 9110
+                    // 8.6, request-smuggling vector on keep-alive).
+                    Some(len) if cl_seen && len != parsed.content_length => {
+                        parsed.bad = Some(400);
+                    }
+                    Some(len) => parsed.content_length = len,
+                    None => parsed.bad = Some(400),
                 }
+                cl_seen = true;
             }
             b"transfer-encoding" => {
                 // v0: chunked request bodies are not supported yet.
                 parsed.bad = Some(411);
             }
-            b"connection" => {
-                if h.value.eq_ignore_ascii_case(b"close") {
+            b"connection"
+                if h.value.eq_ignore_ascii_case(b"close") => {
                     parsed.keep_alive = false;
                 }
-            }
             _ => {}
         }
         parsed.headers.push((name, h.value.to_vec()));
+    }
+
+    // RFC 9110 7.2: an HTTP/1.1 request must carry exactly one Host. Zero is
+    // rejected only for 1.1; more than one is malformed (and a routing /
+    // smuggling vector) at any version.
+    if parsed.bad.is_none()
+        && (host_count > 1 || (host_count == 0 && req.version == Some(1)))
+    {
+        parsed.bad = Some(400);
     }
 
     Some(parsed)
@@ -549,6 +590,20 @@ enum AppRes {
     Upgraded(ResponseStream, Vec<u8>),
 }
 
+/// Unlinks a spilled request-body temp file on drop. The claiming worker
+/// unlinks it right after opening (happy path -> this is a no-op ENOENT);
+/// the guard is the safety net for queue rejection, worker death or a lost
+/// datagram, where no worker ever opens the file.
+struct SpillGuard(Option<std::path::PathBuf>);
+
+impl Drop for SpillGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
     wr: &mut W,
@@ -591,8 +646,19 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         builder.field(name, value);
     }
 
+    // Reserve a queue slot before any per-request setup: a full queue must
+    // reject with 503 before a large body is ever written to disk.
+    let permit = match pool.try_reserve() {
+        Ok(p) => p,
+        Err(_) => {
+            write_simple(wr, 503, "Service Unavailable", keep_alive).await?;
+            return Ok(AppRes::Http(503, None));
+        }
+    };
+
     let mut submit_body = SubmitBody::Inline;
     let mut feed: Option<tokio::task::JoinHandle<(OwnedReadHalf, bool)>> = None;
+    let mut spill_path: Option<std::path::PathBuf> = None;
     match body {
         BodyPlan::Buffered(bytes) => {
             builder.content_length(bytes.len() as u64);
@@ -602,16 +668,13 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
                 static SPILL_SEQ: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let seq = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let spill = pool
-                    .body_temp()
-                    .join(format!("body-{}-{}", std::process::id(), seq))
-                    .to_string_lossy()
-                    .into_owned();
-                if tokio::fs::write(&spill, bytes).await.is_err() {
+                let spill = pool.spill_path(seq);
+                if pool.write_spill(&spill, bytes).await.is_err() {
                     write_simple(wr, 500, "Internal Server Error", keep_alive).await?;
                     return Ok(AppRes::Http(500, None));
                 }
-                builder.preread_body(spill.as_bytes());
+                builder.preread_body(spill.to_string_lossy().as_bytes());
+                spill_path = Some(spill);
                 submit_body = SubmitBody::File;
             } else {
                 builder.preread_body(bytes);
@@ -637,11 +700,14 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         // Upgrade offers carry no body by construction (GET, length 0).
         submit_body = SubmitBody::Upgrade;
     }
+    // Held until the response is fully handled: unlinks the spilled body if
+    // no worker ever consumed it (queue reject, worker death, lost datagram).
+    let _spill_guard = SpillGuard(spill_path);
     let payload = builder.finish();
 
     // Submit into the kernel work queue; any worker with a free slot picks
     // it up directly, the router is out of the pickup path (spec 2.9).
-    let mut worker = match pool.submit(payload, submit_body).await {
+    let mut worker = match pool.submit(permit, payload, submit_body).await {
         Ok(w) => w,
         Err(DispatchError::WorkerFailed) => {
             abort_feed(&feed);
@@ -660,7 +726,16 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
     let (status, worker_headers) = match next_event(&mut worker, pool.first_event_timeout()).await
     {
         Some(WorkerEvent::Headers { status, headers }) => (status, headers),
-        Some(_) | None => {
+        // No output within response_timeout: the worker stalled while the
+        // client waited. next_event already sent Abort; fail with 504 (the
+        // task_timeout sweep, not us, decides whether to kill).
+        None => {
+            abort_feed(&feed);
+            write_simple(wr, 504, "Gateway Timeout", keep_alive).await?;
+            return Ok(AppRes::Http(504, None));
+        }
+        // A non-Headers first event is a worker bug.
+        Some(_) => {
             abort_feed(&feed);
             write_simple(wr, 502, "Bad Gateway", keep_alive).await?;
             return Ok(AppRes::Http(502, None));
@@ -678,27 +753,50 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         return Ok(AppRes::Http(502, None));
     }
 
-    // Hybrid framing: buffer up to the threshold; a response completing
-    // within it goes out with content-length, larger ones stream chunked.
-    const STREAM_THRESHOLD: usize = 64 * 1024;
+    // Hybrid framing, mirroring Apache/mod_php: buffer up to the threshold; a
+    // response completing within it goes out with content-length, larger ones
+    // stream chunked (Apache's core output filter flushes on a full buffer the
+    // same way). An explicit worker flush (PHP `flush()` / SSE) forces the
+    // streaming path so the client sees bytes without waiting for the buffer to
+    // fill — the canonical PHP contract: flush() means "send now, give up
+    // content-length".
+    const STREAM_THRESHOLD: usize = 256 * 1024;
     let mut buffered: Vec<u8> = Vec::new();
     let mut complete = false;
     let mut failed = false;
+    let mut stalled = false;
+    let mut flush_requested = false;
 
-    while !complete && !failed && buffered.len() <= STREAM_THRESHOLD {
+    while !complete && !failed && !stalled && !flush_requested && buffered.len() <= STREAM_THRESHOLD
+    {
         match next_event(&mut worker, event_timeout).await {
             Some(WorkerEvent::Chunk(chunk)) => buffered.extend_from_slice(&chunk),
+            Some(WorkerEvent::Flush) => flush_requested = true,
             Some(WorkerEvent::End) => {
                 complete = true;
             }
             Some(WorkerEvent::Headers { .. } | WorkerEvent::Ws { .. }) => {}
-            Some(WorkerEvent::Failed(_)) | None => {
+            Some(WorkerEvent::Failed(_)) => {
                 failed = true;
+            }
+            // Stall while the client waits: 504 (Abort already sent).
+            None => {
+                stalled = true;
             }
         }
     }
 
-    let mut head = format!("HTTP/1.1 {} {}\r\nserver: {}\r\n", status, reason_phrase(status), SERVER);
+    if stalled {
+        // Headers arrived but the body stalled past response_timeout. Nothing
+        // is on the wire yet (still buffering), so answer a clean 504; the
+        // task keeps running until it winds down or the sweep kills it.
+        abort_feed(&feed);
+        write_simple(wr, 504, "Gateway Timeout", keep_alive).await?;
+        return Ok(AppRes::Http(504, None));
+    }
+
+    let mut head =
+        format!("HTTP/1.1 {} {}\r\nserver: {}\r\n", status, reason_phrase(status), server_header());
     // Worker headers come as `name: value\r\n` lines; hop-by-hop and
     // framing headers are ours to control. response_headers ops: a None
     // value removes the worker's header, Some appends/overrides.
@@ -746,15 +844,66 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         return Ok(AppRes::Http(status, reclaim_rd(feed).await));
     }
 
-    // Streaming path.
+    // Streaming path: the buffer grew past the threshold, or the worker
+    // flushed (SSE / progressive output).
     head.push_str("transfer-encoding: chunked\r\n\r\n");
     wr.write_all(head.as_bytes()).await?;
     write_chunk(wr, &buffered).await?;
     drop(buffered);
 
+    // A flushed stream is long-lived: inter-event gaps are normal, so it uses
+    // the idle budget and flushes every chunk for real-time delivery. A
+    // threshold stream (large bulk body) keeps the strict per-event budget and
+    // lets TCP batch the writes for throughput.
+    let mut streaming = flush_requested;
+    let idle = Duration::from_secs(state.http.idle_timeout);
+    if streaming {
+        wr.flush().await?;
+    }
+
     loop {
-        match next_event(&mut worker, event_timeout).await {
-            Some(WorkerEvent::Chunk(chunk)) => write_chunk(wr, &chunk).await?,
+        // Flushed streams tolerate idle gaps and close gracefully on silence;
+        // bulk streams keep the strict per-event budget where a stall means a
+        // stuck worker (next_event marks it so).
+        let ev = if streaming {
+            match tokio::time::timeout(idle, worker.next_event()).await {
+                Ok(ev) => ev,
+                Err(_) => {
+                    // Prolonged silence: signal the worker its client is gone
+                    // (graceful, honors ignore_user_abort) and close.
+                    worker.send_abort().await;
+                    wr.write_all(b"0\r\n\r\n").await?;
+                    wr.flush().await?;
+                    drop(worker);
+                    return Ok(AppRes::Http(status, reclaim_rd(feed).await));
+                }
+            }
+        } else {
+            next_event(&mut worker, event_timeout).await
+        };
+
+        match ev {
+            Some(WorkerEvent::Chunk(chunk)) => {
+                let sent = async {
+                    write_chunk(wr, &chunk).await?;
+                    if streaming {
+                        wr.flush().await?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                }
+                .await;
+                if let Err(e) = sent {
+                    // Client hung up mid-stream: tell the worker so its handler
+                    // aborts (PHP user-abort) and the slot frees.
+                    worker.send_abort().await;
+                    abort_feed(&feed);
+                    return Err(e);
+                }
+            }
+            Some(WorkerEvent::Flush) => {
+                streaming = true;
+                wr.flush().await?;
+            }
             Some(WorkerEvent::End) => {
                 wr.write_all(b"0\r\n\r\n").await?;
                 wr.flush().await?;
@@ -763,8 +912,9 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
             }
             Some(WorkerEvent::Headers { .. } | WorkerEvent::Ws { .. }) => {}
             Some(WorkerEvent::Failed(_)) | None => {
-                // Mid-stream failure: truncate; the missing final chunk
-                // tells the client the response is broken.
+                // Worker error, or a bulk-stream stall (already marked stuck).
+                // Truncate: the missing final chunk tells the client the
+                // response is broken.
                 wr.flush().await?;
                 abort_feed(&feed);
                 return Err(std::io::Error::other("worker failed mid-stream"));
@@ -773,9 +923,10 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
     }
 }
 
-/// One event with the limits.timeout budget; None = stall. The request is
-/// abandoned and counted against the claiming worker's health — a worker
-/// with every granted slot stuck gets killed by the pool.
+/// One event with the `limits.response_timeout` budget; `None` = the worker
+/// produced nothing while the client waited. The worker is told to wind down
+/// (`Abort`), but NOT killed — that is the `task_timeout` sweep's job. The
+/// caller fails the client (504).
 async fn next_event(
     worker: &mut crate::dispatch::ResponseStream,
     timeout: Duration,
@@ -783,7 +934,7 @@ async fn next_event(
     match tokio::time::timeout(timeout, worker.next_event()).await {
         Ok(ev) => ev,
         Err(_) => {
-            worker.mark_stuck();
+            worker.send_abort().await;
             None
         }
     }
@@ -822,7 +973,8 @@ async fn write_101<W: AsyncWriteExt + Unpin>(
     extra_headers: &[(&str, Option<&str>)],
 ) -> std::io::Result<()> {
     let mut head = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nserver: {SERVER}\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: {}\r\n",
+        "HTTP/1.1 101 Switching Protocols\r\nserver: {}\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: {}\r\n",
+        server_header(),
         ws::accept_key(key),
     );
     for line in worker_headers.split(|&b| b == b'\n') {
@@ -1041,7 +1193,10 @@ pub async fn write_return<W: AsyncWriteExt + Unpin>(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let reason = reason_phrase(status);
-    let mut head = format!("HTTP/1.1 {status} {reason}\r\nserver: {SERVER}\r\ncontent-length: 0\r\n");
+    let mut head = format!(
+        "HTTP/1.1 {status} {reason}\r\nserver: {}\r\ncontent-length: 0\r\n",
+        server_header(),
+    );
     if let Some(loc) = location {
         head.push_str(&format!("location: {loc}\r\n"));
     }
@@ -1069,9 +1224,10 @@ pub async fn write_response<W: AsyncWriteExt + Unpin>(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\nserver: {SERVER}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n",
+        "HTTP/1.1 {status} {reason}\r\nserver: {server}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n",
         body.len(),
         reason = reason_phrase(status),
+        server = server_header(),
     );
     for (name, value) in extra_headers {
         if let Some(value) = value {
@@ -1091,19 +1247,26 @@ pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         101 => "Switching Protocols",
         200 => "OK",
+        204 => "No Content",
+        206 => "Partial Content",
         301 => "Moved Permanently",
         302 => "Found",
         304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         408 => "Request Timeout",
         411 => "Length Required",
         413 => "Content Too Large",
+        416 => "Range Not Satisfiable",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        // A worker may return any code; an empty reason-phrase is RFC-valid.
         _ => "",
     }
 }
@@ -1146,6 +1309,57 @@ mod tests {
     fn parse_rejects_chunked_body() {
         let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(parse_request(raw).unwrap().bad, Some(411));
+    }
+
+    #[test]
+    fn parse_rejects_conflicting_duplicate_content_length() {
+        // Two disagreeing Content-Length headers: a request-smuggling vector
+        // on keep-alive, rejected outright (RFC 9110 8.6).
+        let raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_allows_duplicate_matching_content_length() {
+        // Identical duplicates are harmless (RFC 9110 8.6 permits collapsing).
+        let raw = b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n";
+        let p = parse_request(raw).unwrap();
+        assert!(p.bad.is_none());
+        assert_eq!(p.content_length, 10);
+    }
+
+    #[test]
+    fn parse_rejects_missing_host_on_http11() {
+        // RFC 9110 7.2: HTTP/1.1 must carry exactly one Host.
+        let raw = b"GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_allows_missing_host_on_http10() {
+        // The single-Host requirement is 1.1-only; 1.0 may omit it.
+        let raw = b"GET / HTTP/1.0\r\n\r\n";
+        assert!(parse_request(raw).unwrap().bad.is_none());
+    }
+
+    #[test]
+    fn parse_rejects_multiple_host_headers_http11() {
+        let raw = b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_rejects_multiple_host_headers_http10_too() {
+        // More than one Host is malformed / a routing-confusion vector at any
+        // version, not just 1.1.
+        let raw = b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n";
+        assert_eq!(parse_request(raw).unwrap().bad, Some(400));
+    }
+
+    #[test]
+    fn parse_accepts_single_host_http11() {
+        let raw = b"GET / HTTP/1.1\r\nHost: only.one\r\n\r\n";
+        assert!(parse_request(raw).unwrap().bad.is_none());
     }
 
     #[test]

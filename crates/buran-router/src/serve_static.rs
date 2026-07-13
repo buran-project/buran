@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::http1::{write_return, SERVER};
+use crate::http1::{server_header, write_return};
 use crate::matching::PatternSet;
 
 const COPY_CHUNK: usize = 64 * 1024;
@@ -28,6 +28,9 @@ pub struct StaticContext<'a> {
     pub source_exts: &'a std::collections::BTreeSet<String>,
     /// Per-share extras (fallback application's `execute` list).
     pub extra_source_exts: &'a [String],
+    /// Follow symlinks during resolution; when false, openat2 refuses any
+    /// path component that is a symlink.
+    pub follow_symlinks: bool,
     pub serve_sources: bool,
     pub req_headers: &'a [(Vec<u8>, Vec<u8>)],
     pub head_only: bool,
@@ -70,15 +73,21 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
     let mime = mime_for(&target, ctx.mime_overrides);
 
     // MIME filter: a non-matching type is "not served" -> fallback.
-    if let Some(types) = ctx.types {
-        if !types.matches(mime.as_bytes(), true) {
+    if let Some(types) = ctx.types
+        && !types.matches(mime.as_bytes(), true) {
             return Ok(None);
         }
-    }
 
     let rel = target.trim_start_matches('/').to_string();
     if rel.is_empty() {
         return Ok(None);
+    }
+
+    // IN_ROOT confines resolution to the share root; NO_SYMLINKS additionally
+    // refuses any symlink component when `follow_symlinks: false`.
+    let mut resolve = ResolveFlags::IN_ROOT;
+    if !ctx.follow_symlinks {
+        resolve |= ResolveFlags::NO_SYMLINKS;
     }
 
     // Blocking syscalls (fast): open base, then contained open of the file.
@@ -93,7 +102,7 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
             rel.as_str(),
             OFlags::RDONLY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::IN_ROOT,
+            resolve,
         )?;
         Ok(std::fs::File::from(fd))
     })
@@ -134,7 +143,8 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
     };
     if not_modified {
         let head = format!(
-            "HTTP/1.1 304 Not Modified\r\nserver: {SERVER}\r\netag: {etag}\r\nlast-modified: {last_modified}\r\n{}\r\n",
+            "HTTP/1.1 304 Not Modified\r\nserver: {}\r\netag: {etag}\r\nlast-modified: {last_modified}\r\n{}\r\n",
+            server_header(),
             if ctx.keep_alive { "" } else { "connection: close\r\n" },
         );
         wr.write_all(head.as_bytes()).await?;
@@ -152,7 +162,8 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
             Some(Ok(r)) => r,
             Some(Err(())) => {
                 let head = format!(
-                    "HTTP/1.1 416 Range Not Satisfiable\r\nserver: {SERVER}\r\ncontent-range: bytes */{size}\r\ncontent-length: 0\r\n{}\r\n",
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nserver: {}\r\ncontent-range: bytes */{size}\r\ncontent-length: 0\r\n{}\r\n",
+                    server_header(),
                     if ctx.keep_alive { "" } else { "connection: close\r\n" },
                 );
                 wr.write_all(head.as_bytes()).await?;
@@ -171,8 +182,9 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
     };
 
     let mut head = format!(
-        "HTTP/1.1 {status} {}\r\nserver: {SERVER}\r\ncontent-type: {mime}\r\ncontent-length: {length}\r\netag: {etag}\r\nlast-modified: {last_modified}\r\naccept-ranges: bytes\r\n",
+        "HTTP/1.1 {status} {}\r\nserver: {}\r\ncontent-type: {mime}\r\ncontent-length: {length}\r\netag: {etag}\r\nlast-modified: {last_modified}\r\naccept-ranges: bytes\r\n",
         if status == 206 { "Partial Content" } else { "OK" },
+        server_header(),
     );
     if let Some((start, end)) = range {
         head.push_str(&format!("content-range: bytes {start}-{end}/{size}\r\n"));
@@ -380,6 +392,7 @@ mod tests {
             mime_overrides,
             source_exts,
             extra_source_exts: &[],
+            follow_symlinks: true,
             serve_sources,
             req_headers,
             head_only,

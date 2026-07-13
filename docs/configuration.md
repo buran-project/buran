@@ -88,12 +88,21 @@ Notes:
   file** under `body_temp_path`, and the worker receives the file path instead
   of the bytes — so `body_temp_path` must be writable and ideally on fast local
   storage (e.g. tmpfs). Streaming-capable runtimes receive large bodies as a
-  frame stream rather than a file.
+  frame stream rather than a file. Spill files are created with mode `0600`
+  (request bodies may carry uploads, tokens or passwords, so they are never
+  world- or group-readable); when an application sets `user`, Buran chowns each
+  spill file to that uid so the worker can still open it. Use a directory only
+  Buran and its workers can reach.
 - **`static.mime_types`** extends, never replaces, the built-in MIME table
   (see [Static files](static-files.md)).
-- **WebSocket** connections live outside the regular HTTP budgets:
-  `limits.timeout` and `http.idle_timeout` do **not** apply to an upgraded
-  tunnel; only `websocket.idle_timeout` does.
+- **WebSocket** connections live outside the regular HTTP budgets: the request
+  limits (`limits.response_timeout` / `limits.task_timeout`) and
+  `http.idle_timeout` do **not** apply to an upgraded tunnel; only
+  `websocket.idle_timeout` does.
+- **Keep-alive is HTTP/1.1 only.** An HTTP/1.0 request with
+  `Connection: keep-alive` is served, but the connection is closed after the
+  response (no HTTP/1.0 persistent connections). Put a modern reverse proxy in
+  front if HTTP/1.0 keep-alive matters.
 
 ## `listeners`
 
@@ -108,8 +117,9 @@ listeners:
     status: true
 ```
 
-- Host `*` binds all interfaces. IPv6 literals work too (`"[::1]:8080"` style
-  via `host:port`, e.g. `"::1"` as host).
+- Host `*` binds all IPv4 interfaces. IPv6 literals must be bracketed:
+  `"[::1]:8080"`, `"[::]:8080"` for all IPv6 interfaces. The host is an IP
+  literal or `*` — hostnames are not resolved.
 - The referenced `route` must exist. `route` + `status: true` together is an
   error; so is a listener with neither.
 
@@ -135,8 +145,9 @@ Metrics response shape:
 ```
 
 - `workers` — active worker processes in the pool.
-- `idle` — workers currently idle.
-- `queued` — requests parked waiting for a free worker.
+- `idle` — free request slots (total capacity minus what workers hold right
+  now); for blocking runtimes this equals the idle worker count.
+- `queued` — requests accepted but not yet claimed by any worker.
 
 Use `/health` for container liveness/readiness probes and the root path for
 scraping pool saturation.

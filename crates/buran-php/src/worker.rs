@@ -39,6 +39,12 @@ mod ffi {
     }
 }
 
+/// One `$_SERVER` entry: (name offset, value offset, value length) into the
+/// shared arena.
+type VarEntry = (usize, usize, usize);
+/// Serialized `$_SERVER`: the NUL-terminated name arena plus its entries.
+type ServerVars = (Vec<u8>, Vec<VarEntry>);
+
 /// Per-request state reachable from the C callbacks. Single worker thread,
 /// set strictly for the duration of one `bphp_sapi_request` call.
 struct RequestCtx {
@@ -54,13 +60,17 @@ struct RequestCtx {
     /// (offset, len) ranges. One buffer, reused across requests.
     vars_arena: Vec<u8>,
     /// (name_off, value_off, value_len) into `vars_arena`.
-    vars_entries: Vec<(usize, usize, usize)>,
+    vars_entries: Vec<VarEntry>,
     /// Response header block under construction.
     resp_status: u16,
     resp_headers: Vec<u8>,
     headers_sent: bool,
     /// Set by fastcgi_finish_request(): the client is gone, swallow output.
     client_released: bool,
+    /// Set when a write to the router fails (client hung up mid-stream):
+    /// ub_write then reports a short write so PHP aborts the connection and
+    /// the worker is freed instead of looping forever (SSE).
+    client_gone: bool,
 }
 
 thread_local! {
@@ -99,7 +109,8 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
     let entries_ptr = if entries.is_empty() {
         std::ptr::null()
     } else {
-        let c = CString::new(entries).map_err(|_| WorkerError::Closed)?;
+        let c = CString::new(entries)
+            .map_err(|_| std::io::Error::other("ini directive contains a NUL byte"))?;
         let ptr = c.as_ptr();
         std::mem::forget(c);
         ptr
@@ -107,7 +118,7 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
 
     // Safety: single-threaded, once per process.
     if unsafe { ffi::bphp_sapi_boot(ini_ptr, entries_ptr) } != 0 {
-        return Err(WorkerError::Closed);
+        return Err(std::io::Error::other("php engine boot failed").into());
     }
     Ok(())
 }
@@ -115,17 +126,22 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
 /// Serve requests on an already-booted engine. Forked workers land here;
 /// they exit without engine shutdown (FPM practice — the request boundary
 /// is `php_request_startup/shutdown`, the process just dies).
-pub fn serve(work: &UnixDatagram, stream: UnixStream, app: &AppConfig) -> Result<(), WorkerError> {
+pub fn serve(
+    work: &UnixDatagram,
+    stream: UnixStream,
+    app: &AppConfig,
+    token: u64,
+) -> Result<(), WorkerError> {
     let work = work.try_clone()?;
-    buran_worker::run(work, stream, app.max_requests, |req, flags, resp| {
+    buran_worker::run(work, stream, app.max_requests, token, |req, flags, resp| {
         handle(req, flags, resp, app)
     })
 }
 
-/// Entry point for standalone `--channel` mode (no prototype).
+/// Entry point for standalone `--channel` mode (no prototype, so no token).
 pub fn run(work: &UnixDatagram, stream: UnixStream, app: AppConfig) -> Result<(), WorkerError> {
     boot(&app)?;
-    let result = serve(work, stream, &app);
+    let result = serve(work, stream, &app, 0);
     unsafe { ffi::bphp_sapi_shutdown() };
     result
 }
@@ -228,6 +244,7 @@ fn handle(
         resp_headers: Vec::with_capacity(256),
         headers_sent: false,
         client_released: false,
+        client_gone: false,
     };
 
     CTX.with(|slot| *slot.borrow_mut() = Some(ctx));
@@ -253,11 +270,13 @@ fn handle(
     }
 
     // Script produced no output at all: headers were never flushed by PHP.
-    if let Some(ctx) = leftover {
-        if !ctx.headers_sent {
+    if let Some(ctx) = leftover
+        && !ctx.headers_sent {
+            // Two status sources: the one the script set (`http_response_code`)
+            // and the engine's exit status. Take the max so an engine error
+            // (5xx) is never masked by a script's 2xx/3xx — a fatal wins.
             resp.send_headers(ctx.resp_status.max(status as u16), &ctx.resp_headers)?;
         }
-    }
 
     resp.finish()
 }
@@ -270,6 +289,13 @@ struct ResolvedScript {
 
 /// Intrinsic executable extensions of this runtime; `app.execute` extends
 /// the set (legacy "PHP in .html" deployments).
+///
+/// Deliberately narrower than `--describe`'s `source_extensions` (which also
+/// lists `.phar`): `--describe` drives source-leak protection (what the router
+/// must NOT serve as a static file — a `.phar` is PHP source and must be
+/// hidden), while this set is what we actually hand to the engine as a script.
+/// A `.phar` is executed only via an explicit `script`/`index`, not by
+/// extension, so it is not intrinsic here.
 const INTRINSIC_EXTS: [&str; 2] = [".php", ".phtml"];
 
 /// CGI-like script resolution per spec section 2.5 (matches what frameworks
@@ -338,7 +364,7 @@ fn build_server_vars(
     req: &RequestView<'_>,
     app: &AppConfig,
     script: &ResolvedScript,
-) -> Result<(Vec<u8>, Vec<(usize, usize, usize)>), WorkerError> {
+) -> Result<ServerVars, WorkerError> {
     // Single arena instead of ~25 CString allocations per request: names
     // NUL-terminated in-place, values addressed by (offset, len).
     let mut arena: Vec<u8> = Vec::with_capacity(1024);
@@ -398,6 +424,13 @@ fn build_server_vars(
             content_type_seen = true;
             continue;
         }
+        // Drop headers whose name carries an underscore: `-` maps to `_` when
+        // building the HTTP_ variable, so `X_Forwarded_For` would collide with
+        // `X-Forwarded-For` and let a client spoof a proxy-set header. nginx
+        // does the same by default (`underscores_in_headers off`).
+        if field.name.contains(&b'_') {
+            continue;
+        }
         let mut name = String::with_capacity(5 + field.name.len());
         name.push_str("HTTP_");
         for &b in field.name {
@@ -425,12 +458,47 @@ pub extern "C" fn buran_cb_ub_write(str_: *const c_char, len: usize) -> usize {
     let chunk = unsafe { std::slice::from_raw_parts(str_ as *const u8, len) };
     with_ctx(|ctx| {
         if ctx.client_released {
-            return; // client already answered: swallow, FPM-style
+            return len; // fastcgi_finish_request: swallow, keep running
+        }
+        if ctx.client_gone {
+            return 0; // disconnected earlier: keep signalling the abort
         }
         let resp = responder(ctx);
-        let _ = resp.send_body(chunk);
+        if resp.send_body(chunk).is_err() {
+            // Broken pipe: a short write makes PHP abort the connection so
+            // the worker stops instead of looping (SSE with the client gone).
+            ctx.client_gone = true;
+            return 0;
+        }
+        len
+    })
+    .unwrap_or(0)
+}
+
+/// PHP flush() / ob_flush(): push buffered output to the client now and keep
+/// the response open (SSE, progressive output).
+#[unsafe(no_mangle)]
+pub extern "C" fn buran_cb_flush() {
+    with_ctx(|ctx| {
+        if ctx.client_released || ctx.client_gone {
+            return;
+        }
+        // Headers must precede the first flushed body bytes.
+        if !ctx.headers_sent {
+            let status = ctx.resp_status;
+            let headers = std::mem::take(&mut ctx.resp_headers);
+            let resp = responder(ctx);
+            if resp.send_headers(status, &headers).is_err() {
+                ctx.client_gone = true;
+                return;
+            }
+            ctx.headers_sent = true;
+        }
+        let resp = responder(ctx);
+        if resp.flush().is_err() {
+            ctx.client_gone = true;
+        }
     });
-    len
 }
 
 #[unsafe(no_mangle)]
@@ -536,4 +604,83 @@ pub extern "C" fn buran_cb_finish_request() {
 pub extern "C" fn buran_cb_log(message: *const c_char) {
     let msg = unsafe { std::ffi::CStr::from_ptr(message) };
     eprintln!("php: {}", msg.to_string_lossy());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buran_ipc::RequestBuilder;
+    use std::collections::HashMap;
+
+    /// Rebuild a name -> value map from the `$_SERVER` arena + entry table.
+    fn vars_map(arena: &[u8], entries: &[VarEntry]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|&(name_off, value_off, value_len)| {
+                let name_end =
+                    name_off + arena[name_off..].iter().position(|&b| b == 0).unwrap();
+                let name = String::from_utf8_lossy(&arena[name_off..name_end]).into_owned();
+                let value =
+                    String::from_utf8_lossy(&arena[value_off..value_off + value_len]).into_owned();
+                (name, value)
+            })
+            .collect()
+    }
+
+    fn app() -> AppConfig {
+        serde_json::from_str(r#"{"root":"/www"}"#).unwrap()
+    }
+
+    fn script() -> ResolvedScript {
+        ResolvedScript {
+            filename: "/www/index.php".to_string(),
+            script_name: "/index.php".to_string(),
+            path_info: None,
+        }
+    }
+
+    #[test]
+    fn underscore_headers_are_dropped_to_prevent_spoofing() {
+        // A client-sent `X_Forwarded_For` maps to the same HTTP_ var as a
+        // proxy's `X-Forwarded-For`; dropping the underscore form stops the
+        // spoof (nginx `underscores_in_headers off` parity).
+        let payload = RequestBuilder::new()
+            .method(b"GET")
+            .path(b"/index.php")
+            .target(b"/index.php")
+            .query(b"")
+            .version(b"HTTP/1.1")
+            .remote_addr(b"127.0.0.1")
+            .server_name(b"h")
+            .field(b"x-forwarded-for", b"1.1.1.1")
+            .field(b"x_forwarded_for", b"2.2.2.2")
+            .preread_body(b"")
+            .finish();
+        let view = RequestView::parse(&payload).unwrap();
+        let (arena, entries) = build_server_vars(&view, &app(), &script()).unwrap();
+        let map = vars_map(&arena, &entries);
+
+        assert_eq!(map.get("HTTP_X_FORWARDED_FOR").map(String::as_str), Some("1.1.1.1"));
+        // The spoofed underscore value must not survive under any key.
+        assert!(!map.values().any(|v| v == "2.2.2.2"), "underscore header leaked: {map:?}");
+    }
+
+    #[test]
+    fn ordinary_headers_still_become_http_vars() {
+        let payload = RequestBuilder::new()
+            .method(b"GET")
+            .path(b"/index.php")
+            .target(b"/index.php")
+            .query(b"")
+            .version(b"HTTP/1.1")
+            .remote_addr(b"127.0.0.1")
+            .server_name(b"h")
+            .field(b"accept-encoding", b"gzip")
+            .preread_body(b"")
+            .finish();
+        let view = RequestView::parse(&payload).unwrap();
+        let (arena, entries) = build_server_vars(&view, &app(), &script()).unwrap();
+        let map = vars_map(&arena, &entries);
+        assert_eq!(map.get("HTTP_ACCEPT_ENCODING").map(String::as_str), Some("gzip"));
+    }
 }

@@ -13,7 +13,7 @@ mod template;
 mod uri;
 mod ws;
 
-pub use dispatch::{DispatchError, Pool, ResponseStream, Spawner, SubmitBody, WorkerEvent};
+pub use dispatch::{DispatchError, Pool, ResponseStream, Spawn, Spawner, SubmitBody, WorkerEvent};
 pub use routes::CompiledRoutes;
 
 use std::collections::BTreeMap;
@@ -54,7 +54,7 @@ impl Router {
     /// a process-spawning closure per application (owned by the supervisor).
     pub fn new(
         validated: &Validated,
-        mut spawners: BTreeMap<String, (Spawner, std::os::unix::net::UnixDatagram)>,
+        mut spawners: BTreeMap<String, (Spawner, std::os::unix::net::UnixDatagram, Option<u32>)>,
         source_exts: std::collections::BTreeSet<String>,
     ) -> anyhow::Result<Self> {
         let routes = routes::compile(validated)?;
@@ -62,12 +62,12 @@ impl Router {
         let body_temp = validated.config.settings.http.body_temp_path.clone();
         let mut pools = BTreeMap::new();
         for (name, app) in &validated.applications {
-            let (spawner, work) = spawners
+            let (spawner, work, body_owner) = spawners
                 .remove(name)
                 .with_context(|| format!("no spawner for application {name}"))?;
             pools.insert(
                 name.clone(),
-                Pool::start(name, app, spawner, work, &body_temp)
+                Pool::start(name, app, spawner, work, &body_temp, body_owner)
                     .with_context(|| format!("cannot start pool for {name}"))?,
             );
         }
@@ -92,6 +92,8 @@ impl Router {
         }
 
         let http = validated.config.settings.http.clone();
+        // Fix the `Server:` header once for the process lifetime.
+        http1::init_server_header(http.server_version);
         let mut mime_overrides = BTreeMap::new();
         if let Some(static_) = &http.static_ {
             for (mime, exts) in &static_.mime_types {
@@ -211,10 +213,9 @@ async fn accept_loop(
 }
 
 fn parse_listener_addr(addr: &str) -> anyhow::Result<SocketAddr> {
-    let (host, port) = addr.rsplit_once(':').context("host:port expected")?;
-    let port: u16 = port.parse()?;
-    let ip = if host == "*" { "0.0.0.0".parse()? } else { host.parse()? };
-    Ok(SocketAddr::new(ip, port))
+    // Single source of truth with config validation: `--check-config` and the
+    // actual bind parse listener addresses identically.
+    buran_config::parse_listener_addr(addr).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn bind_reuseport(addr: SocketAddr) -> anyhow::Result<TcpListener> {

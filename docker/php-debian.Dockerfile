@@ -83,6 +83,14 @@ ARG OPCACHE_EXT
 LABEL org.opencontainers.image.title="Buran Application Server"
 LABEL org.opencontainers.image.description="Buran universal application server, PHP (Debian flavor)"
 
+# Pull Debian security patches. The php base image freezes its APT packages at
+# publish time, so shipped packages (curl, linux-libc-dev, ...) drift behind
+# the trixie security repo and light up image scanners. Upgrade in place so the
+# final image carries the patched versions.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
 # Nothing beyond opcache on purpose: extend the image the same way as the
 # official php ones — docker-php-ext-install / pecl; the ini land in the scan
 # dir, which the buran SAPI picks up like any other PHP. See

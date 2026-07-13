@@ -26,6 +26,7 @@ extern const char *buran_cb_cookies(void); /* NUL-terminated or NULL */
 extern void   buran_cb_register_vars(void *track_vars_array);
 extern void   buran_cb_log(const char *message);
 extern void   buran_cb_finish_request(void);
+extern void   buran_cb_flush(void);
 
 /* Called back from Rust inside buran_cb_register_vars(). */
 void bphp_register_var(void *track_vars_array, const char *name,
@@ -60,6 +61,15 @@ static size_t buran_ub_write(const char *str, size_t str_length)
 static void buran_flush(void *server_context)
 {
     (void)server_context;
+    /* Headers must reach the client before any flushed body. Let PHP emit the
+     * real status + header block through send_headers first; otherwise a
+     * flush() issued before the first body write (e.g. a PSR emitter that
+     * flushes after echoing) ships a premature default 200 with no headers,
+     * because buran_cb_flush would send them from the still-zeroed context. */
+    if (!SG(headers_sent)) {
+        sapi_send_headers();
+    }
+    buran_cb_flush();
 }
 
 static int buran_send_headers(sapi_headers_struct *sapi_headers)
