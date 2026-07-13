@@ -478,17 +478,24 @@ fn parse_request(head: &[u8]) -> Option<Parsed> {
         bad: None,
     };
 
+    let mut cl_seen = false;
+    let mut host_count = 0u32;
     for h in req.headers.iter() {
         let name = h.name.to_ascii_lowercase().into_bytes();
         match name.as_slice() {
+            b"host" => host_count += 1,
             b"content-length" => {
-                parsed.content_length = std::str::from_utf8(h.value)
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(u64::MAX);
-                if parsed.content_length == u64::MAX {
-                    parsed.bad = Some(400);
+                match std::str::from_utf8(h.value).ok().and_then(|v| v.parse::<u64>().ok()) {
+                    // Conflicting duplicate Content-Length: reject rather than
+                    // let last-wins disagree with an upstream proxy (RFC 9110
+                    // 8.6, request-smuggling vector on keep-alive).
+                    Some(len) if cl_seen && len != parsed.content_length => {
+                        parsed.bad = Some(400);
+                    }
+                    Some(len) => parsed.content_length = len,
+                    None => parsed.bad = Some(400),
                 }
+                cl_seen = true;
             }
             b"transfer-encoding" => {
                 // v0: chunked request bodies are not supported yet.
@@ -502,6 +509,15 @@ fn parse_request(head: &[u8]) -> Option<Parsed> {
             _ => {}
         }
         parsed.headers.push((name, h.value.to_vec()));
+    }
+
+    // RFC 9110 7.2: an HTTP/1.1 request must carry exactly one Host. Zero is
+    // rejected only for 1.1; more than one is malformed (and a routing /
+    // smuggling vector) at any version.
+    if parsed.bad.is_none()
+        && (host_count > 1 || (host_count == 0 && req.version == Some(1)))
+    {
+        parsed.bad = Some(400);
     }
 
     Some(parsed)
