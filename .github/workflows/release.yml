@@ -1,6 +1,10 @@
 # Release: build the full image matrix and publish to GHCR + Docker Hub.
 #
-# Trigger: a bare x.y.z tag (no "v" prefix), e.g. `git tag 0.1.0 && git push --tags`.
+# Trigger: publishing a GitHub Release whose tag is a bare x.y.z (no "v"
+# prefix). The maintainer cuts the release (UI or `gh release create`); this
+# workflow only builds and *attaches* artifacts to that existing release — it
+# never creates one. The x.y.z contract is enforced by the `guard` job below,
+# because `on: release` (unlike `push.tags`) cannot filter by tag format.
 #
 # Topology: each platform builds natively on its own runner (no QEMU — Rust
 # release builds under emulation take hours) and pushes every tag with an
@@ -19,21 +23,34 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
+  release:
+    types: [published]
 
 env:
   # Docker Hub: append ",docker.io/${{ vars.DOCKERHUB_REPO }}"
   REPO: ghcr.io/${{ github.repository }}
-  VERSION: ${{ github.ref_name }}
+  VERSION: ${{ github.event.release.tag_name }}
 
 jobs:
+  # `on: release` carries no tag-format filter, so the x.y.z contract is
+  # enforced here and every other job gates on it (directly or transitively):
+  # a release cut with a stray tag name fails loudly instead of publishing junk.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce x.y.z release tag
+        run: |
+          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "!! release tag '$VERSION' is not x.y.z — refusing to publish"
+            exit 1
+          }
+
   # Discover the package build matrix from packaging/platforms/ — one entry per
   # dir with a ci-build.sh. The builder image (rpm -> fedora, not derivable from
   # the dir name) is read from the recipe's `# ci-image:` marker. Add a platform
   # dir and it registers itself; no edit here.
   matrix:
+    needs: guard
     runs-on: ubuntu-latest
     outputs:
       packages: ${{ steps.list.outputs.packages }}
@@ -56,6 +73,7 @@ jobs:
           echo "packages=$pkgs" >> "$GITHUB_OUTPUT"
 
   build:
+    needs: guard
     strategy:
       fail-fast: false
       matrix:
@@ -123,9 +141,11 @@ jobs:
                 docker buildx imagetools create -t "$t" "$t-amd64" "$t-arm64"
               done
 
-  # GitHub release + tarballs: sources and vendored crates (the latter is
-  # what distro maintainers need — official builds have no network).
+  # Source + vendor tarballs attached to the release the maintainer published
+  # (the vendored crates are what distro maintainers need — official builds
+  # have no network).
   release:
+    needs: guard
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -142,12 +162,12 @@ jobs:
           cargo vendor vendor >/dev/null
           tar czf "buran-$VERSION-vendor.tar.gz" vendor
 
-      - name: Create GitHub release
+      - name: Attach tarballs to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$VERSION" --verify-tag --generate-notes \
-            "buran-$VERSION.tar.gz" "buran-$VERSION-vendor.tar.gz"
+          gh release upload "$VERSION" \
+            "buran-$VERSION.tar.gz" "buran-$VERSION-vendor.tar.gz" --clobber
 
   # Publish the SDK crates to crates.io so third parties can build runtime
   # modules. Only buran-ipc + buran-worker are public (the rest are
@@ -177,8 +197,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -eu
-          # Idempotent by design: rebuilding the same release (re-pushing the
-          # tag to republish images after a distro CVE patch, or retrying a
+          # Idempotent by design: re-running the workflow for the same release
+          # (republishing images after a distro CVE patch, or retrying a
           # half-failed run) must not try to re-upload a version that already
           # exists — crates.io forbids that. Skip crates already on the registry
           # and only publish genuinely new ones. Order stays leaf-first; cargo

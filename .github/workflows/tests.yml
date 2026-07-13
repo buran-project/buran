@@ -14,8 +14,24 @@ name: tests
 
 on:
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'docker/**'
+      - 'tests/**'
+      - Cargo.toml
+      - Cargo.lock
+      - docker-bake.hcl
+      - .github/workflows/tests.yml
   push:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'docker/**'
+      - 'tests/**'
+      - Cargo.toml
+      - Cargo.lock
+      - docker-bake.hcl
+      - .github/workflows/tests.yml
 
 jobs:
   # buran-php needs libphp to link and is covered per-cell below; everything
