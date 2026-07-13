@@ -1,44 +1,56 @@
-# 🚀 Buran
+# 🚀 Buran Application Server
+
+**English** · [Русский](README.ru.md) · [中文](README.zh.md)
 
 [![Project Status: Active](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
 [![Tests](https://github.com/buran-project/buran/actions/workflows/tests.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/tests.yml)
 [![Security Scan](https://github.com/buran-project/buran/actions/workflows/scan.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/scan.yml)
 [![Release](https://github.com/buran-project/buran/actions/workflows/release.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/release.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.85+-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![PHP](https://img.shields.io/badge/PHP-7.3_–_8.5-777BB4?logo=php&logoColor=white)](https://www.php.net/)
 [![Container](https://img.shields.io/badge/ghcr.io-buran--project%2Fburan-2496ED?logo=docker&logoColor=white)](https://github.com/buran-project/buran/pkgs/container/buran)
 [![License](https://img.shields.io/github/license/buran-project/buran)](LICENSE)
 
-**Buran** is a universal application server written in Rust. It terminates HTTP,
-serves static files, routes requests, and runs your application code in a pool
-of embedded worker processes — one native binary, one declarative YAML config.
+**Buran** is an application server written in Rust. It serves static files,
+routes requests, and runs your application code in a pool of embedded worker
+processes — the whole edge described by one declarative YAML config.
 
-If you have used **nginx + php-fpm** or **NGINX Unit**, Buran will feel
-instantly familiar: the network and routing live in one process, workers execute
-application code, and there is no separate FastCGI daemon to babysit.
+Its core is runtime-agnostic: language runtimes attach as separate pluggable
+modules instead of being compiled into the server. **PHP is the first supported
+runtime**, and more are planned.
 
-> 🌍 **Runtime-agnostic core.** Language runtimes are pluggable modules, not
-> baked into the server. **PHP is the first supported runtime** (embedded
-> in-process via `libphp`); support for more languages is planned.
+If you have run **nginx + FastCGI** or **NGINX Unit**, the shape is familiar:
+networking and routing in one process, workers executing application code, no
+separate daemon wedged in between.
 
 ## ✨ Why Buran?
 
-- 📦 **One binary, one config** – The server, router, static file handler and
-  process supervisor are a single native binary. Everything is described in one
-  YAML file.
-- ⚡ **Embedded runtimes** – PHP runs in-process inside workers through a custom
-  SAPI over `libphp`. No FastCGI hop, no php-fpm to manage.
-- 🔌 **Pluggable modules** – Runtimes are separate `buran-<runtime>` binaries.
-  Several versions coexist side by side (`buran-php83`, `buran-php84`, …); more
-  languages can be added without touching the core.
-- 🛡️ **Safe by default** – Source files a runtime declares as executable (for
-  PHP: `.php`, `.phtml`, …) are **never** served as static content, even if a
-  rule would otherwise match them.
+- 📦 **One config, one edge** – Router, static file handler and process
+  supervisor live in a single native server binary; listeners, routes and
+  applications are all described in one YAML file.
+- 🔌 **Pluggable runtimes** – Runtimes attach as separate `buran-<runtime>`
+  module binaries, so several versions run side by side (`buran-php83`,
+  `buran-php84`, …) and new languages land without touching the core.
+- ⚡ **In-process execution** – Worker processes run application code directly
+  under the server's supervision — no FastCGI hop, no external process manager.
+- 🛡️ **Safe by default** – Source files a runtime declares as executable are
+  **never** served as static content, even if a rule would otherwise match them.
 - 🧊 **Static configuration** – No live admin API. A config change means a
   reload/restart (or, in containers, a new container) — running state stays
   predictable and auditable.
 - 🐳 **Container-native** – Runs correctly as PID 1 (reaps orphans, graceful
   `SIGTERM`/`SIGINT` shutdown). Official runtime images ship per version.
+
+## 🧩 Supported languages
+
+Runtimes plug in as separate modules, so the list grows without touching the
+core. What runs today:
+
+| Language | Image flavors | Status |
+|----------|---------------|--------|
+| [![PHP](https://img.shields.io/badge/PHP-7.3_–_8.5-777BB4?logo=php&logoColor=white)](https://www.php.net/) | Debian, Alpine | ✅ Supported |
+
+Several versions coexist side by side (`buran-php83`, `buran-php84`, …), so one
+image can serve applications pinned to different branches.
 
 ## 📋 Prerequisites
 
@@ -113,7 +125,7 @@ buran --check-config --config /etc/buran/buran.yaml
 ```
 
 This checks the schema **and** probes every runtime module for protocol
-compatibility, then exits. Perfect for CI.
+compatibility, then exits non-zero on any problem — safe to gate a deploy on.
 
 ## 🧭 How it works
 

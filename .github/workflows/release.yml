@@ -26,6 +26,14 @@ on:
   release:
     types: [published]
 
+# One run per release: a re-run, a re-publish, or a quick edit->publish must
+# not race a run already in flight on the same tag (imagetools create + release
+# upload touch shared state). Let the in-flight run finish rather than tearing
+# it down mid-push.
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 env:
   # Docker Hub: append ",docker.io/${{ vars.DOCKERHUB_REPO }}"
   REPO: ghcr.io/${{ github.repository }}
@@ -133,13 +141,16 @@ jobs:
 
       - name: Stitch multi-arch manifests
         run: |
-          set -eu
-          docker buildx bake --print 2>/dev/null \
-            | jq -r '[.target[].tags[]] | unique | .[]' \
-            | while read -r t; do
-                echo ">> $t"
-                docker buildx imagetools create -t "$t" "$t-amd64" "$t-arm64"
-              done
+          set -euo pipefail
+          # Fail loud if bake can't be evaluated: an empty tag list here would
+          # otherwise "succeed" while stitching nothing, leaving only the
+          # per-arch tags in the registry and no clean multi-arch ones.
+          tags="$(docker buildx bake --print | jq -r '[.target[].tags[]] | unique | .[]')"
+          [ -n "$tags" ] || { echo "!! no tags resolved from bake — refusing to stitch nothing"; exit 1; }
+          printf '%s\n' "$tags" | while read -r t; do
+            echo ">> $t"
+            docker buildx imagetools create -t "$t" "$t-amd64" "$t-arm64"
+          done
 
   # Source + vendor tarballs attached to the release the maintainer published
   # (the vendored crates are what distro maintainers need — official builds
