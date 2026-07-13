@@ -59,15 +59,19 @@ fn reject_anchors(yaml: &str) -> Result<(), ConfigError> {
             Some(pos) => &line[..pos],
             None => line,
         };
-        // Quick scan: `&name` / `*name` tokens outside of quoted scalars.
+        // Quick scan: `&name` / `*name` tokens outside of quoted scalars. An
+        // anchor/alias sits at a node position: after whitespace in block
+        // style, or right after a flow indicator (`[`, `{`, `,`, `:`) — the
+        // latter is how `key: [*alias]` slips past a whitespace-only check.
         let mut in_single = false;
         let mut in_double = false;
         let mut prev = ' ';
         for ch in code.chars() {
+            let at_node = prev.is_whitespace() || matches!(prev, '[' | '{' | ',' | ':');
             match ch {
                 '\'' if !in_double => in_single = !in_single,
                 '"' if !in_single => in_double = !in_double,
-                '&' | '*' if !in_single && !in_double && prev.is_whitespace() => {
+                '&' | '*' if !in_single && !in_double && at_node => {
                     return Err(ConfigError::AnchorForbidden { line: i + 1 });
                 }
                 _ => {}
