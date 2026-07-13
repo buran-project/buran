@@ -95,6 +95,18 @@ pub fn validate(mut config: Config) -> Result<Validated, ConfigError> {
         }
     }
 
+    // Resolve `processes: auto` (and omitted `processes:`, which defaults to
+    // Auto) to a concrete `Fixed(N)` once, before validation and before the
+    // router ever sees an application. Detect the CPU count a single time and
+    // reuse it for every application. After this no `Processes::Auto` survives
+    // in a `Validated`.
+    let auto_processes = Processes::Fixed(crate::auto_worker_count());
+    for app in config.applications.values_mut().chain(applications.values_mut()) {
+        if matches!(app.processes, Processes::Auto) {
+            app.processes = auto_processes.clone();
+        }
+    }
+
     for (name, app) in &applications {
         validate_application(app, &format!("applications.{name}"))?;
     }

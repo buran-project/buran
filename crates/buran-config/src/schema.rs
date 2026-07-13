@@ -244,17 +244,19 @@ pub struct Application {
     pub options: Option<serde_norway::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, Default)]
 pub enum Processes {
     Fixed(u32),
     Dynamic {
         max: u32,
-        #[serde(default)]
         spare: u32,
-        #[serde(default = "default_idle_timeout")]
         idle_timeout: u64,
     },
+    /// `processes: auto` or an omitted `processes:`. Resolved to `Fixed(N)`
+    /// (N = effective CPUs) at config load, before validation or the router
+    /// ever sees it — see `crate::auto_worker_count` and `validate`.
+    #[default]
+    Auto,
 }
 
 impl Processes {
@@ -262,14 +264,70 @@ impl Processes {
         match *self {
             Self::Fixed(n) => n,
             Self::Dynamic { max, .. } => max,
+            Self::Auto => crate::auto_worker_count(),
         }
     }
 }
 
-impl Default for Processes {
-    fn default() -> Self {
-        Self::Fixed(1)
+/// Accepts a positive integer (`Fixed`), the string `auto` (`Auto`), or a
+/// `{ max, spare?, idle_timeout? }` table (`Dynamic`). Hand-written because
+/// `#[serde(untagged)]` cannot mix a bare string variant with a numeric and a
+/// map one, and untagged silently swallows unknown keys — we want them to fail.
+impl<'de> Deserialize<'de> for Processes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProcessesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ProcessesVisitor {
+            type Value = Processes;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a positive integer, \"auto\", or a { max, spare, idle_timeout } table")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Processes, E> {
+                let n = u32::try_from(v).map_err(|_| E::custom(format!("processes {v} exceeds u32")))?;
+                Ok(Processes::Fixed(n))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Processes, E> {
+                let n = u32::try_from(v).map_err(|_| E::custom(format!("processes {v} out of range")))?;
+                Ok(Processes::Fixed(n))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Processes, E> {
+                if v == "auto" {
+                    Ok(Processes::Auto)
+                } else {
+                    Err(E::custom(format!("expected a number, \"auto\", or a table, got \"{v}\"")))
+                }
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Processes, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let raw = <DynamicRaw as Deserialize>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(Processes::Dynamic { max: raw.max, spare: raw.spare, idle_timeout: raw.idle_timeout })
+            }
+        }
+
+        deserializer.deserialize_any(ProcessesVisitor)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DynamicRaw {
+    max: u32,
+    #[serde(default)]
+    spare: u32,
+    #[serde(default = "default_idle_timeout")]
+    idle_timeout: u64,
 }
 
 fn default_idle_timeout() -> u64 {

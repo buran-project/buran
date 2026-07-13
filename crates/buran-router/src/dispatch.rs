@@ -205,7 +205,13 @@ impl Pool {
         body_owner: Option<u32>,
     ) -> anyhow::Result<Arc<Pool>> {
         let (initial, max, spare, idle_exit) = match app.processes {
+            // Auto is resolved to Fixed at config load; resolve here too as a
+            // backstop so a hand-built Application never leaves the pool at 0.
             Processes::Fixed(n) => (n, n, n, None),
+            Processes::Auto => {
+                let n = buran_config::auto_worker_count();
+                (n, n, n, None)
+            }
             Processes::Dynamic { max, spare, idle_timeout } => {
                 let spare = spare.max(1);
                 (spare, max, spare, Some(Duration::from_secs(idle_timeout)))

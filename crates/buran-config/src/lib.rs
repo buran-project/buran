@@ -5,10 +5,12 @@
 //! over string scalars -> typed `Config` (strict: unknown fields are errors,
 //! anchors/aliases are rejected before parsing) -> `validate()`.
 
+mod cpu;
 mod schema;
 mod subst;
 mod validate;
 
+pub use cpu::auto_worker_count;
 pub use schema::*;
 pub use validate::{parse_listener_addr, Validated};
 
@@ -429,6 +431,84 @@ applications:
             ConfigError::Invalid { path, .. } => assert_eq!(path, "applications.app.processes.spare"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_auto_processes_resolves_to_fixed() {
+        let yaml = "\
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        application: app
+applications:
+  app:
+    module: php85
+    processes: auto
+";
+        let app = from_str(yaml).unwrap().applications.get("app").unwrap().clone();
+        match app.processes {
+            Processes::Fixed(n) => assert!(n >= 1),
+            other => panic!("expected auto to resolve to Fixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn omitted_processes_defaults_to_auto() {
+        let yaml = "\
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        application: app
+applications:
+  app:
+    module: php85
+";
+        let app = from_str(yaml).unwrap().applications.get("app").unwrap().clone();
+        assert!(matches!(app.processes, Processes::Fixed(n) if n >= 1));
+    }
+
+    #[test]
+    fn non_auto_processes_string_is_rejected() {
+        let yaml = "\
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        application: app
+applications:
+  app:
+    module: php85
+    processes: many
+";
+        assert!(matches!(err(yaml), ConfigError::Yaml(_)));
+    }
+
+    #[test]
+    fn unknown_dynamic_processes_field_is_rejected() {
+        let yaml = "\
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    - action:
+        application: app
+applications:
+  app:
+    module: php85
+    processes:
+      max: 4
+      spair: 2
+";
+        assert!(matches!(err(yaml), ConfigError::Yaml(_)));
     }
 
     #[test]

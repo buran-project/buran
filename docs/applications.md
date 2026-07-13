@@ -60,7 +60,19 @@ character).
 
 ## Process pools
 
-`processes` is either a fixed count or a dynamic pool.
+`processes` is `auto`, a fixed count, or a dynamic pool.
+
+**Auto** (the default) — one worker per available CPU. This is what you get when
+`processes` is omitted:
+
+```yaml
+processes: auto
+```
+
+The count is the host's parallelism, clamped by the cgroup CPU quota when one is
+set (`docker --cpus`, k8s `limits.cpu`) so a container gets workers for the cores
+it was actually granted, not every core on the host. There is no upper cap — a
+512-core box gets 512 workers. Floor is 1.
 
 **Fixed** — a constant number of workers:
 

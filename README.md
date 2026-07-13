@@ -92,7 +92,7 @@ applications:
     module: php85                  # → /usr/lib/buran/modules/buran-php85
     root: /www
     index: index.php
-    processes: 2
+    processes: auto                 # one worker per CPU (the default; clamped by cgroup quota)
 ```
 
 ### 2. Run it 🐳
