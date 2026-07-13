@@ -24,7 +24,7 @@ jobs:
     outputs:
       tags: ${{ steps.list.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Collect canonical tags of the supported group
         id: list
@@ -46,7 +46,7 @@ jobs:
       matrix:
         image: ${{ fromJSON(needs.matrix.outputs.tags) }}
     steps:
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
