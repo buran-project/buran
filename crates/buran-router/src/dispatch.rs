@@ -724,8 +724,14 @@ async fn read_frame(stream: &mut BufReader<OwnedReadHalf>) -> std::io::Result<(F
     stream.read_exact(&mut head).await?;
     let header = FrameHeader::decode(&head)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut payload = vec![0u8; header.payload_len as usize];
-    stream.read_exact(&mut payload).await?;
+    // Grow the buffer as bytes actually arrive rather than pre-allocating the
+    // worker-declared length: a bogus payload_len (buggy worker, up to 4 GiB)
+    // then hits EOF instead of committing gigabytes of zeroed memory.
+    let want = u64::from(header.payload_len);
+    let mut payload = Vec::new();
+    if stream.take(want).read_to_end(&mut payload).await? as u64 != want {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    }
     Ok((header, payload))
 }
 

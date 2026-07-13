@@ -167,8 +167,11 @@ fn read_frame(stream: &mut UnixStream) -> (FrameHeader, Vec<u8>) {
     let mut head = [0u8; FRAME_HEADER_LEN];
     stream.read_exact(&mut head).expect("read header");
     let header = FrameHeader::decode(&head).expect("decode header");
-    let mut payload = vec![0u8; header.payload_len as usize];
-    stream.read_exact(&mut payload).expect("read payload");
+    // Grow with the data rather than trusting payload_len up front.
+    let want = u64::from(header.payload_len);
+    let mut payload = Vec::new();
+    let read = (&mut *stream).take(want).read_to_end(&mut payload).expect("read payload");
+    assert_eq!(read as u64, want, "short frame payload");
     (header, payload)
 }
 

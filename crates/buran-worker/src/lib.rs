@@ -233,8 +233,13 @@ fn read_frame(reader: &mut BufReader<UnixStream>) -> Result<(FrameHeader, Vec<u8
         Err(e) => return Err(e.into()),
     }
     let header = FrameHeader::decode(&head)?;
-    let mut payload = vec![0u8; header.payload_len as usize];
-    reader.read_exact(&mut payload)?;
+    // Grow with the data instead of pre-allocating payload_len: a bogus header
+    // hits EOF rather than committing gigabytes of zeroed memory.
+    let want = u64::from(header.payload_len);
+    let mut payload = Vec::new();
+    if reader.by_ref().take(want).read_to_end(&mut payload)? as u64 != want {
+        return Err(WorkerError::Closed);
+    }
     Ok((header, payload))
 }
 

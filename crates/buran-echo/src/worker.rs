@@ -346,8 +346,13 @@ async fn read_frame(
     let mut head = [0u8; FRAME_HEADER_LEN];
     rd.read_exact(&mut head).await?;
     let header = FrameHeader::decode(&head).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut payload = vec![0u8; header.payload_len as usize];
-    rd.read_exact(&mut payload).await?;
+    // Grow with the data instead of trusting payload_len up front (avoids a
+    // 4 GiB pre-allocation from a bogus header).
+    let want = u64::from(header.payload_len);
+    let mut payload = Vec::new();
+    if rd.take(want).read_to_end(&mut payload).await? as u64 != want {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    }
     Ok((header, payload))
 }
 
