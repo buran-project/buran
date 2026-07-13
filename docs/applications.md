@@ -175,14 +175,28 @@ RUN docker-php-ext-install -j"$(nproc)" pdo_mysql
 The generated INI lands in the scan dir and the Buran SAPI picks it up like any
 other PHP.
 
-### Streaming responses (SSE, progressive output)
+### Response framing & streaming (SSE, progressive output)
 
-Buran supports real-time streaming. A `flush()` (or `ob_flush()` + `flush()`)
-in the script pushes whatever has been written so far to the client
-immediately: the router switches that response to chunked transfer and
-forwards every subsequent write as it arrives, instead of buffering for a
-`Content-Length`. This is what Server-Sent Events, long-polling and
-progressive rendering need.
+Buran follows the **canonical Apache/mod_php contract** here — the script
+controls framing, not the server:
+
+- **No `flush()` — buffered.** The response is collected until the script
+  returns and sent with an exact `Content-Length`, in one shot. This is the
+  common case (a rendered page, a JSON payload).
+- **`flush()` (or `ob_flush()` + `flush()`) — streamed.** The flush pushes
+  whatever has been written so far to the client immediately; the router
+  switches that response to chunked transfer and forwards every subsequent
+  write as it arrives. This is what Server-Sent Events, long-polling and
+  progressive rendering need — and it means `flush()` deliberately gives up
+  `Content-Length`, exactly as it does under Apache.
+- **Oversized buffered responses.** A response that grows past **256 KiB**
+  without a `flush()` is streamed chunked rather than held whole in memory —
+  the same way Apache's core output filter flushes on a full buffer. Below the
+  threshold you always get `Content-Length`.
+
+nginx + php-fpm differs: it re-buffers the FastCGI response and by default
+absorbs the script's `flush()`, so the client framing is nginx's decision, not
+the app's. Buran stays with the older, more predictable PHP semantics.
 
 ```php
 header('Content-Type: text/event-stream');

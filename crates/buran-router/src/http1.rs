@@ -753,11 +753,14 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
         return Ok(AppRes::Http(502, None));
     }
 
-    // Hybrid framing: buffer up to the threshold; a response completing
-    // within it goes out with content-length, larger ones stream chunked.
-    // An explicit worker flush (SSE) also forces the streaming path so the
-    // client sees bytes without waiting for the buffer to fill.
-    const STREAM_THRESHOLD: usize = 64 * 1024;
+    // Hybrid framing, mirroring Apache/mod_php: buffer up to the threshold; a
+    // response completing within it goes out with content-length, larger ones
+    // stream chunked (Apache's core output filter flushes on a full buffer the
+    // same way). An explicit worker flush (PHP `flush()` / SSE) forces the
+    // streaming path so the client sees bytes without waiting for the buffer to
+    // fill — the canonical PHP contract: flush() means "send now, give up
+    // content-length".
+    const STREAM_THRESHOLD: usize = 256 * 1024;
     let mut buffered: Vec<u8> = Vec::new();
     let mut complete = false;
     let mut failed = false;
