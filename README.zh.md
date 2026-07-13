@@ -10,7 +10,7 @@
 [![Tests](https://github.com/buran-project/buran/actions/workflows/tests.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/tests.yml)
 [![Security Scan](https://github.com/buran-project/buran/actions/workflows/scan.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/scan.yml)
 [![Release](https://github.com/buran-project/buran/actions/workflows/release.yml/badge.svg)](https://github.com/buran-project/buran/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/Rust-1.85+-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.88+-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Container](https://img.shields.io/badge/ghcr.io-buran--project%2Fburan-2496ED?logo=docker&logoColor=white)](https://github.com/buran-project/buran/pkgs/container/buran)
 [![License](https://img.shields.io/github/license/buran-project/buran)](LICENSE)
 
@@ -55,7 +55,7 @@
 
 - **Docker** — 只需要一个容器运行时。官方镜像已内置 Buran、一个 PHP 模块和
   opcache。
-- **从源码构建** — Rust **1.85+**。PHP 模块另需一个以 `--enable-embed` 构建的
+- **从源码构建** — Rust **1.88+**。PHP 模块另需一个以 `--enable-embed` 构建的
   `libphp`，外加 `php-config` 和 C 工具链（核心服务器本身**不**依赖 PHP）。
 
 ## ⚡ 快速开始
