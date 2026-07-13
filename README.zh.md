@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/cover.jpg" alt="Buran Application Server">
+</p>
+
 # 🚀 Buran Application Server
 
 [English](README.md) · [Русский](README.ru.md) · **中文**
