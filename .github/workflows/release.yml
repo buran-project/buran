@@ -193,17 +193,26 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify tag matches crate version
+      # A release can ship without a crate version bump (e.g. re-cutting images
+      # after a distro CVE patch). Then the crate version simply lags the tag
+      # and there's nothing new to publish — so skip the publish step instead
+      # of failing the job. crates.io is immutable anyway: republishing an
+      # existing version would error out regardless.
+      - name: Check crate version matches tag
+        id: crate_version
         run: |
           set -eu
           v="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="buran-ipc") | .version')"
-          [ "$v" = "$VERSION" ] || {
-            echo "!! tag $VERSION does not match crate version $v — bump Cargo.toml first"
-            exit 1
-          }
+          if [ "$v" = "$VERSION" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo ">> crate version $v does not match tag $VERSION — skipping crates.io publish"
+          fi
 
       - name: Publish to crates.io
+        if: steps.crate_version.outputs.publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
