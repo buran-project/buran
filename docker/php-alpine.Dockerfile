@@ -44,12 +44,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
 # --- Core server binary (no PHP dependency) -----------------------------------
-# Left statically linked (musl default): zero runtime deps.
+# Dynamically linked against the base image's musl (crt-static off) so an
+# operator can swap the malloc implementation at runtime via LD_PRELOAD
+# (jemalloc ships in the final image; see below). Runtime deps are the base
+# musl plus libgcc_s — Rust std pulls the latter on musl even with
+# panic=abort; both are installed in the final image.
 FROM rust AS core
 ARG BASE
 
 RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/buran/target,id=buran-core-alpine-${BASE},sharing=locked \
+    RUSTFLAGS="-C target-feature=-crt-static" \
     cargo build --release -p buran \
     && install -m 755 -s target/release/buran /buran
 
@@ -95,14 +100,21 @@ LABEL org.opencontainers.image.description="Buran universal application server, 
 # libphp scans as usual. See tests/applications/wordpress/Dockerfile for the
 # pattern.
 # libgcc backs the dynamically linked buran-php module.
+# jemalloc replaces the musl allocator, whose global-lock malloc serialises
+# under multi-thread contention. Both the core and the PHP module (and every
+# child: workers, php CLI, composer) inherit it via the LD_PRELOAD set below;
+# an operator can point it at another allocator or clear it (-e LD_PRELOAD=).
 # The plain `php` command ships only with the distro-default branch — the
 # ecosystem (composer, wp-cli's `env php` shebang) expects it, so symlink
 # the image's own version when the package did not provide it.
 # `apk upgrade` first pulls any Alpine security patches the pinned base tag
 # has drifted behind, so image scanners see the fixed package versions.
 RUN apk upgrade --no-cache \
-    && apk add --no-cache libgcc ${PHP_PKG} ${PHP_PKG}-embed ${OPCACHE_PKG} ${EXTRA_PKGS} \
+    && apk add --no-cache libgcc jemalloc ${PHP_PKG} ${PHP_PKG}-embed ${OPCACHE_PKG} ${EXTRA_PKGS} \
     && { command -v php >/dev/null || ln -s ${PHP_PKG} /usr/bin/php; }
+
+# Default allocator for buran and every child process. Override at runtime.
+ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
 
 COPY --from=core /buran /usr/sbin/buran
 COPY --from=module /out/ /usr/lib/buran/modules/
