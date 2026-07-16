@@ -18,6 +18,15 @@ ARG BASE=trixie
 # Extension name to build opcache from; empty when statically built-in (8.5+).
 ARG OPCACHE_EXT=""
 
+# Allocator injected via LD_PRELOAD (see final stage): apt package(s) to install
+# and the soname to preload. Empty by default — glibc's per-thread-arena malloc
+# has no musl-style global-lock contention, so nothing is overridden. Opt in
+# with e.g.:
+#   --build-arg ALLOCATOR_PKG=libjemalloc2 \
+#   --build-arg ALLOCATOR_LIB=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+ARG ALLOCATOR_PKG=""
+ARG ALLOCATOR_LIB=""
+
 # --- Rust toolchain on the bare distro release --------------------------------
 # PHP-free on purpose: this stage and `core` are identical across every PHP
 # version on the same BASE (and shared with minimal-debian.Dockerfile), so
@@ -79,6 +88,8 @@ RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
 # --- Final image ---------------------------------------------------------------
 FROM php:${PHP_VERSION}-cli-${BASE}
 ARG OPCACHE_EXT
+ARG ALLOCATOR_PKG
+ARG ALLOCATOR_LIB
 
 LABEL org.opencontainers.image.title="Buran Application Server"
 LABEL org.opencontainers.image.description="Buran universal application server, PHP (Debian flavor)"
@@ -87,8 +98,11 @@ LABEL org.opencontainers.image.description="Buran universal application server, 
 # publish time, so shipped packages (curl, linux-libc-dev, ...) drift behind
 # the trixie security repo and light up image scanners. Upgrade in place so the
 # final image carries the patched versions.
+# ALLOCATOR_PKG (empty by default) installs an optional allocator in the same
+# pass, before the apt lists are dropped.
 RUN apt-get update \
     && apt-get upgrade -y \
+    && { [ -z "${ALLOCATOR_PKG}" ] || apt-get install --no-install-recommends -y ${ALLOCATOR_PKG}; } \
     && rm -rf /var/lib/apt/lists/*
 
 # Nothing beyond opcache on purpose: extend the image the same way as the
@@ -96,6 +110,10 @@ RUN apt-get update \
 # dir, which the buran SAPI picks up like any other PHP. See
 # tests/applications/wordpress/Dockerfile for the pattern.
 RUN [ -z "${OPCACHE_EXT}" ] || docker-php-ext-install -j"$(nproc)" ${OPCACHE_EXT}
+
+# Default allocator for buran and every child process. Empty is a no-op (glibc
+# default); override at runtime with -e LD_PRELOAD=... regardless.
+ENV LD_PRELOAD=${ALLOCATOR_LIB}
 
 COPY --from=core /buran /usr/sbin/buran
 COPY --from=module /out/ /usr/lib/buran/modules/

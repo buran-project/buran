@@ -25,6 +25,18 @@ ARG OPCACHE_PKG=""
 # json moved into core only in 8.0).
 ARG EXTRA_PKGS=""
 
+# Allocator injected via LD_PRELOAD (see final stage): package(s) to install
+# and the soname to preload. Defaults to jemalloc, whose arena-per-thread
+# design avoids musl's global-lock malloc contention. Override to ship another
+# allocator (ALLOCATOR_PKG may be a space-separated list), or set both empty to
+# keep the musl allocator:
+#   --build-arg ALLOCATOR_PKG=mimalloc \
+#   --build-arg ALLOCATOR_LIB=/usr/lib/libmimalloc.so.2
+# Bake passes both empty for legacy EOL bases (7.3/3.12, 7.4/3.15, 8.0/3.16):
+# Alpine carries the jemalloc package only from 3.17 on.
+ARG ALLOCATOR_PKG=jemalloc
+ARG ALLOCATOR_LIB=/usr/lib/libjemalloc.so.2
+
 # --- Rust toolchain on the bare distro release --------------------------------
 # PHP-free on purpose: this stage and `core` are identical across every PHP
 # version on the same BASE (and shared with minimal-alpine.Dockerfile), so
@@ -91,6 +103,8 @@ FROM alpine:${BASE}
 ARG PHP_PKG
 ARG OPCACHE_PKG
 ARG EXTRA_PKGS
+ARG ALLOCATOR_PKG
+ARG ALLOCATOR_LIB
 
 LABEL org.opencontainers.image.title="Buran Application Server"
 LABEL org.opencontainers.image.description="Buran universal application server, PHP (Alpine flavor)"
@@ -100,21 +114,25 @@ LABEL org.opencontainers.image.description="Buran universal application server, 
 # libphp scans as usual. See tests/applications/wordpress/Dockerfile for the
 # pattern.
 # libgcc backs the dynamically linked buran-php module.
-# jemalloc replaces the musl allocator, whose global-lock malloc serialises
-# under multi-thread contention. Both the core and the PHP module (and every
-# child: workers, php CLI, composer) inherit it via the LD_PRELOAD set below;
-# an operator can point it at another allocator or clear it (-e LD_PRELOAD=).
+# The default allocator (jemalloc) replaces musl's global-lock malloc, which
+# serialises under multi-thread contention. Both the core and the PHP module
+# (and every child: workers, php CLI, composer) inherit it via the LD_PRELOAD
+# set below; an operator can point it at another allocator or clear it
+# (-e LD_PRELOAD=). ALLOCATOR_PKG/ALLOCATOR_LIB (see top) pick a different one,
+# and are empty on legacy bases that ship no jemalloc.
 # The plain `php` command ships only with the distro-default branch — the
 # ecosystem (composer, wp-cli's `env php` shebang) expects it, so symlink
 # the image's own version when the package did not provide it.
 # `apk upgrade` first pulls any Alpine security patches the pinned base tag
 # has drifted behind, so image scanners see the fixed package versions.
 RUN apk upgrade --no-cache \
-    && apk add --no-cache libgcc jemalloc ${PHP_PKG} ${PHP_PKG}-embed ${OPCACHE_PKG} ${EXTRA_PKGS} \
+    && apk add --no-cache libgcc ${ALLOCATOR_PKG} ${PHP_PKG} ${PHP_PKG}-embed ${OPCACHE_PKG} ${EXTRA_PKGS} \
     && { command -v php >/dev/null || ln -s ${PHP_PKG} /usr/bin/php; }
 
-# Default allocator for buran and every child process. Override at runtime.
-ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
+# Default allocator for buran and every child process. Override at runtime with
+# -e LD_PRELOAD=... (or -e LD_PRELOAD= to fall back to musl). Empty on legacy
+# bases that ship no allocator package — an empty value is a no-op.
+ENV LD_PRELOAD=${ALLOCATOR_LIB}
 
 COPY --from=core /buran /usr/sbin/buran
 COPY --from=module /out/ /usr/lib/buran/modules/

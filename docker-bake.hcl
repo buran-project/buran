@@ -113,14 +113,18 @@ target "php-debian" {
   name     = "php-${replace(item.php, ".", "-")}-debian"
   matrix = {
     item = [
-      { php = "7.3", base = "bullseye", opc = "opcache" }, # legacy, EOL base: built once, never rebuilt
-      { php = "7.4", base = "bullseye", opc = "opcache" }, # legacy
-      { php = "8.0", base = "bullseye", opc = "opcache" }, # legacy
-      { php = "8.1", base = "trixie", opc = "opcache" },   # legacy
-      { php = "8.2", base = "trixie", opc = "opcache" },
-      { php = "8.3", base = "trixie", opc = "opcache" },
-      { php = "8.4", base = "trixie", opc = "opcache" },
-      { php = "8.5", base = "trixie", opc = "" },
+      # alloc/alloc_lib: same allocator knob as the Alpine flavor, empty here —
+      # glibc's per-thread-arena malloc has no musl-style global-lock problem,
+      # so the default ships no override. To opt one cell in, set e.g.
+      # alloc = "libjemalloc2", alloc_lib = "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2".
+      { php = "7.3", base = "bullseye", opc = "opcache", alloc = "", alloc_lib = "" }, # legacy, EOL base: built once, never rebuilt
+      { php = "7.4", base = "bullseye", opc = "opcache", alloc = "", alloc_lib = "" }, # legacy
+      { php = "8.0", base = "bullseye", opc = "opcache", alloc = "", alloc_lib = "" }, # legacy
+      { php = "8.1", base = "trixie", opc = "opcache", alloc = "", alloc_lib = "" },   # legacy
+      { php = "8.2", base = "trixie", opc = "opcache", alloc = "", alloc_lib = "" },
+      { php = "8.3", base = "trixie", opc = "opcache", alloc = "", alloc_lib = "" },
+      { php = "8.4", base = "trixie", opc = "opcache", alloc = "", alloc_lib = "" },
+      { php = "8.5", base = "trixie", opc = "", alloc = "", alloc_lib = "" },
     ]
   }
   dockerfile = "docker/php-debian.Dockerfile"
@@ -128,6 +132,9 @@ target "php-debian" {
     PHP_VERSION = item.php
     BASE        = item.base # FROM php:${PHP_VERSION}-cli-${BASE}
     OPCACHE_EXT = item.opc
+    # Allocator baked in and preloaded, straight from the matrix cell.
+    ALLOCATOR_PKG = item.alloc
+    ALLOCATOR_LIB = item.alloc_lib
   }
   # Module identity for CI (read from `bake --print`) and image self-description
   # — keeps the test workflow language-agnostic, no PHP knowledge baked in there.
@@ -152,23 +159,29 @@ target "php-alpine" {
     item = [
       # extra: json was a separate apk package until it moved into core in
       # 8.0 (the debian flavor has it compiled in — parity demands it here).
-      { php = "7.3", base = "3.12", pkg = "php7", opc = "php7-opcache", extra = "php7-json" }, # legacy, EOL base: built once, never rebuilt
-      { php = "7.4", base = "3.15", pkg = "php7", opc = "php7-opcache", extra = "php7-json" }, # legacy
-      { php = "8.0", base = "3.16", pkg = "php8", opc = "php8-opcache", extra = "" },          # legacy
-      { php = "8.1", base = "3.19", pkg = "php81", opc = "php81-opcache", extra = "" },        # legacy
-      { php = "8.2", base = "3.22", pkg = "php82", opc = "php82-opcache", extra = "" },
-      { php = "8.3", base = "3.24", pkg = "php83", opc = "php83-opcache", extra = "" },
-      { php = "8.4", base = "3.24", pkg = "php84", opc = "php84-opcache", extra = "" },
-      { php = "8.5", base = "3.24", pkg = "php85", opc = "", extra = "" },
+      # alloc/alloc_lib: allocator package baked in per cell and its soname to
+      # preload via LD_PRELOAD. jemalloc where Alpine carries it (3.17+); empty
+      # on legacy EOL bases that ship no jemalloc, leaving the musl allocator.
+      { php = "7.3", base = "3.12", pkg = "php7", opc = "php7-opcache", extra = "php7-json", alloc = "", alloc_lib = "" }, # legacy, EOL base: built once, never rebuilt
+      { php = "7.4", base = "3.15", pkg = "php7", opc = "php7-opcache", extra = "php7-json", alloc = "", alloc_lib = "" }, # legacy
+      { php = "8.0", base = "3.16", pkg = "php8", opc = "php8-opcache", extra = "", alloc = "", alloc_lib = "" },          # legacy
+      { php = "8.1", base = "3.19", pkg = "php81", opc = "php81-opcache", extra = "", alloc = "jemalloc", alloc_lib = "/usr/lib/libjemalloc.so.2" }, # legacy
+      { php = "8.2", base = "3.22", pkg = "php82", opc = "php82-opcache", extra = "", alloc = "jemalloc", alloc_lib = "/usr/lib/libjemalloc.so.2" },
+      { php = "8.3", base = "3.24", pkg = "php83", opc = "php83-opcache", extra = "", alloc = "jemalloc", alloc_lib = "/usr/lib/libjemalloc.so.2" },
+      { php = "8.4", base = "3.24", pkg = "php84", opc = "php84-opcache", extra = "", alloc = "jemalloc", alloc_lib = "/usr/lib/libjemalloc.so.2" },
+      { php = "8.5", base = "3.24", pkg = "php85", opc = "", extra = "", alloc = "jemalloc", alloc_lib = "/usr/lib/libjemalloc.so.2" },
     ]
   }
   dockerfile = "docker/php-alpine.Dockerfile"
   args = {
-    PHP_VERSION = item.php
-    BASE        = item.base
-    PHP_PKG     = item.pkg
-    OPCACHE_PKG = item.opc
-    EXTRA_PKGS  = item.extra
+    PHP_VERSION  = item.php
+    BASE         = item.base
+    PHP_PKG      = item.pkg
+    OPCACHE_PKG  = item.opc
+    EXTRA_PKGS   = item.extra
+    # Allocator baked in and preloaded, straight from the matrix cell.
+    ALLOCATOR_PKG = item.alloc
+    ALLOCATOR_LIB = item.alloc_lib
   }
   # See php-debian: module identity for CI + image self-description.
   labels = {
