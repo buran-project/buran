@@ -182,12 +182,14 @@ pub async fn serve_connection(
     let remote = peer.ip().to_string();
 
     loop {
-        // Deadline for the whole header block of the next request. `None`
-        // until the first byte arrives: a kept-alive connection may sit idle
-        // (bounded by idle_timeout), but once a request starts the entire
-        // header block must land within one header_timeout window regardless
-        // of how the bytes are paced.
-        let mut header_deadline: Option<Instant> = None;
+        // Deadline for the whole header block of the next request. A kept-alive
+        // connection with an empty buffer may sit idle (bounded by idle_timeout)
+        // until the first byte arrives; but if the previous request already left
+        // partial next-request bytes in `buf` (pipelining), the header budget is
+        // running from the start. Once a request has begun the entire header
+        // block must land within one header_timeout window regardless of pacing.
+        let mut header_deadline: Option<Instant> =
+            (!buf.is_empty()).then(|| Instant::now() + header_timeout);
         // Read until end of headers.
         let headers_end = loop {
             if let Some(pos) = find_headers_end(&buf) {

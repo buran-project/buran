@@ -179,20 +179,6 @@ async fn accept_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     loop {
-        // Reserve a connection slot BEFORE accepting. At the cap this blocks,
-        // so surplus connections wait in the kernel accept backlog (no fd on
-        // our side) instead of being accepted and parked. The permit rides
-        // into the connection task and frees the slot when it finishes.
-        let permit = match &tracker.limit {
-            Some(sem) => tokio::select! {
-                p = Arc::clone(sem).acquire_owned() => match p {
-                    Ok(p) => Some(p),
-                    Err(_) => return Ok(()), // semaphore closed
-                },
-                _ = shutdown.changed() => return Ok(()),
-            },
-            None => None,
-        };
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = shutdown.changed() => return Ok(()),
@@ -216,6 +202,23 @@ async fn accept_loop(
                 }
                 continue;
             }
+        };
+
+        // Reserve a connection slot AFTER accepting, so a permit is only ever
+        // held by a listener that actually has a connection: an idle listener
+        // never parks a permit inside accept() and cannot starve a busy one
+        // sharing the cap. At the cap the loop blocks here (having accepted one
+        // connection); the rest wait in the kernel backlog. The permit rides
+        // into the connection task and frees the slot when it finishes.
+        let permit = match &tracker.limit {
+            Some(sem) => tokio::select! {
+                p = Arc::clone(sem).acquire_owned() => match p {
+                    Ok(p) => Some(p),
+                    Err(_) => return Ok(()), // semaphore closed
+                },
+                _ = shutdown.changed() => return Ok(()), // drop the accepted stream
+            },
+            None => None,
         };
         let kind = kind.clone();
         let state = Arc::clone(&state);
