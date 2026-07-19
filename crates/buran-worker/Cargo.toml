@@ -1,10 +1,13 @@
 [package]
 name = "buran-worker"
 description = "Buran worker SDK: BWP worker-side loop for runtime modules"
-version.workspace = true
+# Published SDK crate — versioned independently of the server. Bump only when
+# this crate's own API/behaviour changes. 0.2.1: bounded HelloAck read.
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 
 [dependencies]
 buran-ipc = { workspace = true }

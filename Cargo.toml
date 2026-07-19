@@ -11,7 +11,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+# Server version: the buran binary, images and distro packages. The published
+# SDK crates (buran-ipc, buran-worker) set their OWN version in their manifest
+# and are NOT tied to this — they bump only when their API changes.
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/buran-project/buran"
@@ -19,8 +22,9 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 # A `version` is required only on deps pulled in by a *published* crate
-# (buran-worker -> buran-ipc) — crates.io resolves the registry copy by it.
-# The rest stay path-only; their crates are publish = false.
+# (buran-worker -> buran-ipc) — crates.io resolves the registry copy by it, so
+# this pin must track buran-ipc's own (independent) version. The rest stay
+# path-only; their crates are publish = false.
 buran-config = { path = "crates/buran-config" }
 buran-ipc = { path = "crates/buran-ipc", version = "0.2.0" }
 buran-router = { path = "crates/buran-router" }
