@@ -266,6 +266,24 @@ applications:
     }
 
     #[test]
+    fn empty_serve_sources_list_opts_nothing_in_and_is_allowed() {
+        // `serve_sources: []` opts nothing in, so it behaves like protection-on
+        // and must NOT trip the app-fallback rejection.
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action:
+        share: { share: /www$uri, serve_sources: [] }
+        fallback: { application: app }
+applications:
+  app: { module: test }
+";
+        assert!(from_str(yaml).is_ok());
+    }
+
+    #[test]
     fn serve_sources_list_without_app_fallback_is_allowed() {
         // A scoped opt-out (only .php) with a non-application fallback is fine.
         let yaml = "\

@@ -210,9 +210,15 @@ pub enum ServeSources {
 }
 
 impl ServeSources {
-    /// Whether this opts out of protection in any form (`true` or a list).
+    /// Whether this actually opts out of protection for anything. An empty
+    /// `Only([])` list opts nothing in, so it behaves like `None` (protection
+    /// stays on) rather than tripping the app-fallback rejection for a no-op.
     pub fn is_enabled(&self) -> bool {
-        !matches!(self, ServeSources::None)
+        match self {
+            ServeSources::None => false,
+            ServeSources::All => true,
+            ServeSources::Only(exts) => !exts.is_empty(),
+        }
     }
 }
 
