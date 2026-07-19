@@ -26,7 +26,7 @@ Pass an object to control indexing, extension filtering and symlinks:
     index: index.html             # directory index file
     types: ["!*.php"]             # extension allow/deny patterns
     follow_symlinks: false        # refuse to serve through symlinks
-    serve_sources: false          # opt out of source-leak protection (danger)
+    serve_sources: false          # opt out of source-leak protection (danger); or [".php"]
 ```
 
 | Field | Meaning |
@@ -35,7 +35,7 @@ Pass an object to control indexing, extension filtering and symlinks:
 | `index` | File served when the resolved path is a directory. |
 | `types` | Pattern set filtering which files may be served (same syntax as [route patterns](routing.md#pattern-syntax)). |
 | `follow_symlinks` | When `false`, paths resolving through a symlink are refused. |
-| `serve_sources` | Opt out of source-leak protection. Off by default; see below. |
+| `serve_sources` | Opt out of source-leak protection: `false` (default), `true` (all sources), or a list like `[".php"]` (only those). See below. |
 
 ## Source-leak protection
 
@@ -58,13 +58,59 @@ this:
       application: site
 ```
 
-`serve_sources: true` opts a specific share out of this protection. It exists
-for rare, deliberate cases (e.g. an app that ships `.php` snippets as
-downloadable examples). Leave it off unless you are certain.
+`serve_sources` opts a specific share out of this protection. It exists for
+rare, deliberate cases (e.g. an app that ships `.php` snippets as downloadable
+examples). Prefer the **least-privilege list form** — `serve_sources: [".php"]`
+serves only `.php` raw and keeps every other source extension protected —
+over the blanket `serve_sources: true` (all sources). Leave it off unless you
+are certain.
+
+Serving source is refused in one case: a share that opts out **and** has a
+`fallback` reaching an application is rejected at config load, because it would
+serve that application's own source (they share the file tree). Put downloadable
+sources under a separate share that has no application fallback.
 
 The `execute` field on an application (see [Applications](applications.md))
 adds extra executable extensions — those are likewise excluded from static
 serving in shares that fall back to that application.
+
+## What is *not* protected: sensitive files are your responsibility
+
+Source-leak protection only covers what a runtime can tell Buran about —
+**executable source extensions**. Buran has no way to know which *other* files
+under a share root are sensitive, because that is entirely deployment-specific.
+A `share: /var/www$uri` serves **everything** under `/var/www` that is not an
+executable source — including `.env`, `.git/`, `*.bak`, `config.yaml`,
+`composer.json`, editor swap files, and so on.
+
+Buran deliberately does **not** ship a default dotfile denylist, matching nginx
+and Apache (which serve dotfiles by default; Apache blocks only `.ht*`). A blanket
+`/\.` deny is wrong here:
+
+- `/.well-known/` is a dotfile path required for **ACME/Let's Encrypt** HTTP-01,
+  `security.txt`, and more — a blanket deny breaks certificate issuance.
+- A `.git/` directory is sometimes served **on purpose** (dumb HTTP git protocol),
+  so even denying `.git` by default would break legitimate setups.
+
+What is sensitive is a property of your deployment, not of Buran — so **denying
+it is the administrator's job**. Keep secrets out of the document root, and add
+an explicit deny step in front of the `share` for anything that must never be
+served. Route patterns support `~regex`, so one step covers a family:
+
+```yaml
+routes:
+  main:
+    # Refuse the files this deployment considers sensitive. Tune the list.
+    - match: { uri: "~/\\.(git|env|ht[a-z]*)(/|$)" }
+      action: { return: 404 }
+    - action:
+        share: /var/www$uri
+        fallback:
+          application: site
+```
+
+Return `404` (not `403`) to avoid confirming a file exists. Order matters:
+the deny step must come **before** the `share`.
 
 ## MIME types
 
@@ -81,3 +127,22 @@ settings:
 ```
 
 Each entry maps a MIME type to the extensions that should use it.
+
+## Security headers for served content
+
+Like nginx and Apache, Buran does not add security response headers by default —
+`content-type` for static files comes from a fixed extension table (never from
+request bytes), so there is no MIME-injection vector. But if a `share` serves
+**user-uploaded** content, add `X-Content-Type-Options: nosniff` so a browser
+cannot sniff an `application/octet-stream` upload as HTML and run injected
+script in your origin. Set it (and any other headers like `Content-Security-Policy`
+or `X-Frame-Options`) per route with `response_headers`:
+
+```yaml
+- match: { uri: "/uploads/*" }
+  action:
+    share: /var/www$uri
+    response_headers:
+      x-content-type-options: nosniff
+      content-disposition: attachment      # force download rather than render
+```

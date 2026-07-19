@@ -19,6 +19,7 @@ listeners:     # address → route/status bindings (at least one required)
 routes:        # named ordered lists of match → action steps
 applications:  # named runtime application definitions
 access_log:    # optional access log path
+error_log:     # optional diagnostic log path (default: stderr)
 ```
 
 All sections except `listeners` are optional. A minimal static file server:
@@ -43,10 +44,12 @@ settings:
   modules: /usr/lib/buran/modules   # directory holding runtime module binaries
   http:
     header_read_timeout: 30         # seconds to read the request headers
-    body_read_timeout: 30           # seconds to read the request body
+    body_read_timeout: 30           # seconds of silence between body reads
     send_timeout: 30                # seconds to write the response
     idle_timeout: 180               # seconds a keep-alive connection may idle
     max_body_size: 8388608          # largest request body (bytes), 8 MiB
+    min_body_rate: 256              # min body throughput (bytes/s); 0 disables
+    max_connections: 4096           # process-wide connection cap; 0 disables
     body_temp_path: /var/tmp/buran  # spill directory for large bodies
     server_version: true            # include the version in the Server header
     static:
@@ -69,10 +72,12 @@ settings:
 | Key | Default | Unit | Description |
 |-----|---------|------|-------------|
 | `header_read_timeout` | `30` | seconds | Time allowed to read the full request headers. |
-| `body_read_timeout` | `30` | seconds | Time allowed to read the request body. |
+| `body_read_timeout` | `30` | seconds | Max silence between successive body reads before the request is cut (a hard stall). |
 | `send_timeout` | `30` | seconds | Time allowed to write the response. |
 | `idle_timeout` | `180` | seconds | How long a keep-alive connection may sit idle between requests. |
 | `max_body_size` | `8388608` | bytes | Hard cap on request body size; larger requests get `413`. |
+| `min_body_rate` | `256` | bytes/s | Sustained minimum body throughput after a `body_read_timeout` grace window; a slower client is cut (slow-POST / RUDY defence). `0` disables. |
+| `max_connections` | `4096` | count | Process-wide cap on concurrent connections (all listeners). At the cap the server stops accepting; surplus connections wait in the kernel backlog (no fd consumed). **Counts long-lived WebSocket tunnels** — raise it above expected concurrency for WS-heavy apps. `0` disables. |
 | `body_temp_path` | `/var/tmp/buran` | path | Directory where oversized bodies spill to a temp file (see below). |
 | `server_version` | `true` | bool | Include the Buran version in the `Server` response header. |
 | `static.mime_types` | — | map | Extra `MIME → [extensions]` mappings, **added to** the built-in table. |
@@ -104,6 +109,38 @@ Notes:
   response (no HTTP/1.0 persistent connections). Put a modern reverse proxy in
   front if HTTP/1.0 keep-alive matters.
 
+### WebSocket security: gate the upgrade on `Origin`
+
+WebSocket connections are **not** subject to the browser's CORS/same-origin
+policy, but the browser still attaches the target site's cookies to them. So a
+page on `evil.example` can open `wss://your-app/ws`, and if the endpoint
+authenticates by cookie it rides the victim's session — **Cross-Site WebSocket
+Hijacking (CSWSH)**.
+
+Like nginx and Apache, Buran does **not** validate `Origin` on the handshake by
+default — that policy is deployment-specific and yours to set. Buran gives you
+two places to enforce it:
+
+1. **In the route**, match the `origin` header before dispatching the upgrade
+   and reject everything else. Browsers always send `Origin` on a WS handshake
+   and JavaScript cannot forge it, so an allowlist match is a reliable barrier:
+
+   ```yaml
+   routes:
+     main:
+       - match:
+           uri: "/ws"
+           headers: { origin: "https://app.example.com" }   # trusted origin(s)
+         action: { application: site }
+       - match: { uri: "/ws" }        # any other origin (or none)
+         action: { return: 403 }
+   ```
+
+2. **In the application**, which receives the header as
+   `$_SERVER['HTTP_ORIGIN']` and can check it against its own allowlist.
+
+If your WS endpoint carries authentication, one of these is mandatory.
+
 ## `listeners`
 
 Each key is a `host:port` address. A listener either enters a **route** or
@@ -125,13 +162,14 @@ listeners:
 
 ### The status endpoint
 
-A listener with `status: true` answers two things and never enters routing —
-keep it on an internal address:
+A listener with `status: true` answers two fixed paths and never enters routing.
+It still exposes pool topology, so keep it on an internal address:
 
 | Path | Response |
 |------|----------|
 | `/health` | `{"status":"ok"}` — a cheap liveness probe. |
-| anything else | Pool metrics for every application. |
+| `/health/applications` | Pool metrics for every application. |
+| anything else | `404` — no metrics are served on unlisted paths. |
 
 Metrics response shape:
 
@@ -149,8 +187,8 @@ Metrics response shape:
   now); for blocking runtimes this equals the idle worker count.
 - `queued` — requests accepted but not yet claimed by any worker.
 
-Use `/health` for container liveness/readiness probes and the root path for
-scraping pool saturation.
+Use `/health` for container liveness/readiness probes and
+`/health/applications` for scraping pool saturation.
 
 ## `routes` and `applications`
 
@@ -178,6 +216,37 @@ access_log: /var/log/buran/access.log
   wire response** (headers + body), not body bytes only.
 - Writes go through a dedicated task and are flushed per line, so request
   handling never blocks on disk and no lines are lost on container kill.
+
+## `error_log`
+
+Destination for the server's **diagnostic log** — its own `info`/`warn`/`error`
+events *and* every worker's `stdout`/`stderr` (PHP warnings, `error_log` output
+that PHP sends to stderr). Omit it to write to **stderr** (the container-native
+default); set a path to write to a file instead:
+
+```yaml
+error_log: /var/log/buran/error.log      # omit -> stderr
+```
+
+- The **level** is controlled by the `RUST_LOG` environment variable (default
+  `info`), e.g. `RUST_LOG=warn` or `RUST_LOG=buran_router=debug`.
+- Writing is **non-blocking**: a background writer drains a bounded queue, so a
+  log burst (e.g. an app spewing warnings) never blocks request handling. Under
+  sustained backpressure lines are dropped rather than stalling the server.
+- `--check-config` and `--modules` always log to stderr and never open this
+  file, so validation stays independent of the log directory.
+- **A fatal startup error is always printed to stderr**, even when `error_log`
+  is a file: errors before the logger is up (bad CLI, unreadable config, an
+  `error_log` file that cannot be opened) and the final error that stops the
+  process go to stderr so they are never swallowed. The running diagnostic trail
+  goes to the file; if the server fails to start, look in stderr for the cause.
+- **Log rotation:** Buran holds the file open, so a rename-based `logrotate`
+  would leave it writing to the old inode. Use `copytruncate` (or ship the file
+  with a log agent instead). Because the writer buffers, a hard crash
+  (`panic = "abort"`) may lose the last few unflushed lines — for
+  crash-forensics keep the default stderr and let the platform capture it.
+- If a PHP app sets its own `error_log` ini to a file, PHP writes there
+  directly, bypassing this setting.
 
 ## Environment variable substitution
 

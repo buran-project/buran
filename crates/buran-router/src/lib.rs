@@ -122,9 +122,12 @@ impl Router {
         self,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        let max_conn = self.state.http.max_connections;
         let tracker = Arc::new(ConnTracker {
             count: std::sync::atomic::AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
+            limit: (max_conn > 0)
+                .then(|| Arc::new(tokio::sync::Semaphore::new(max_conn as usize))),
         });
         let mut joins = Vec::new();
 
@@ -158,10 +161,14 @@ impl Router {
     }
 }
 
-/// Live connection accounting for graceful drain.
+/// Live connection accounting for graceful drain and the process-wide
+/// concurrency cap (`settings.http.max_connections`).
 struct ConnTracker {
     count: std::sync::atomic::AtomicUsize,
     drained: tokio::sync::Notify,
+    /// `None` when the cap is disabled (`max_connections: 0`). Otherwise a
+    /// permit is taken before each accept and held for the connection's life.
+    limit: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 async fn accept_loop(
@@ -172,6 +179,20 @@ async fn accept_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     loop {
+        // Reserve a connection slot BEFORE accepting. At the cap this blocks,
+        // so surplus connections wait in the kernel accept backlog (no fd on
+        // our side) instead of being accepted and parked. The permit rides
+        // into the connection task and frees the slot when it finishes.
+        let permit = match &tracker.limit {
+            Some(sem) => tokio::select! {
+                p = Arc::clone(sem).acquire_owned() => match p {
+                    Ok(p) => Some(p),
+                    Err(_) => return Ok(()), // semaphore closed
+                },
+                _ = shutdown.changed() => return Ok(()),
+            },
+            None => None,
+        };
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = shutdown.changed() => return Ok(()),
@@ -202,6 +223,8 @@ async fn accept_loop(
         tracker.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
+            // Held for the whole connection; dropping it frees a cap slot.
+            let _permit = permit;
             if let Err(e) = http1::serve_connection(stream, peer, kind, state, conn_shutdown).await {
                 tracing::debug!(%peer, error = %e, "connection closed with error");
             }

@@ -33,12 +33,41 @@ enum Command {
     Kill(u64),
 }
 
-pub fn run(control_fd: RawFd, work_fd: RawFd, app: AppConfig) -> ! {
+/// Upper bound on the length-prefixed app-config the supervisor may send. The
+/// config is tiny; this is only a guard against a corrupt length prefix.
+const MAX_APP_CONFIG: usize = 1 << 20; // 1 MiB
+
+/// Read the app config the supervisor sends over the control socket: a u32
+/// little-endian length prefix followed by that many JSON bytes.
+fn read_app_config(control: &UnixStream) -> Result<AppConfig, String> {
+    let mut len_buf = [0u8; 4];
+    (&mut &*control).read_exact(&mut len_buf).map_err(|e| format!("length: {e}"))?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_APP_CONFIG {
+        return Err(format!("app config length {len} exceeds {MAX_APP_CONFIG}"));
+    }
+    let mut buf = vec![0u8; len];
+    (&mut &*control).read_exact(&mut buf).map_err(|e| format!("body: {e}"))?;
+    serde_json::from_slice(&buf).map_err(|e| e.to_string())
+}
+
+pub fn run(control_fd: RawFd, work_fd: RawFd) -> ! {
     // Safety: both fds are inherited from the supervisor per the module
     // contract. The work socket is shared by every forked worker: the
     // kernel delivers each request datagram to exactly one of them.
     let control = unsafe { UnixStream::from_raw_fd(control_fd) };
     let work = unsafe { UnixDatagram::from_raw_fd(work_fd) };
+
+    // The supervisor sends the app config over the control socket before any
+    // command (never on argv: ini values may hold secrets and argv is
+    // world-readable via /proc/<pid>/cmdline). Read it first, still as root.
+    let app = match read_app_config(&control) {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("buran-php prototype: reading app config: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Privilege drop before the engine boots; groups first, then gid, then
     // uid (setuid drops the right to change the others). Workers inherit the
@@ -168,7 +197,15 @@ fn recv_command(control: &UnixStream) -> std::io::Result<Option<Command>> {
         let mut fd = None;
         for cmsg in msg.cmsgs().map_err(std::io::Error::from)? {
             if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                fd = fds.first().copied();
+                for extra in fds {
+                    // Keep the first fd; close any surplus so a misbehaving peer
+                    // attaching several fds cannot leak them into the prototype.
+                    // Safety: we are the sole owner of each freshly received fd.
+                    match fd {
+                        None => fd = Some(extra),
+                        Some(_) => drop(unsafe { OwnedFd::from_raw_fd(extra) }),
+                    }
+                }
             }
         }
         (msg.bytes, fd)

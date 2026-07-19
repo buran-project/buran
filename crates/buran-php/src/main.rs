@@ -2,8 +2,9 @@
 //!
 //! Modes:
 //! - `--describe` — module contract, JSON to stdout
-//! - `--prototype --control <fd> --work <fd> --app-config <json>` — boot once,
-//!   fork warm workers
+//! - `--prototype --control <fd> --work <fd>` — boot once, fork warm workers.
+//!   The app config is read from the control socket (length-prefixed JSON),
+//!   not argv, so ini secrets stay out of `/proc/<pid>/cmdline`.
 //! - `--channel <fd> --work <fd> --app-config <json>` — standalone BWP worker
 //! - `--exec <script.php> [n]` — phase-0 PoC over the embed SAPI
 
@@ -94,17 +95,9 @@ fn main() -> ExitCode {
                 eprintln!("buran-php: --prototype requires --work <fd>");
                 return ExitCode::FAILURE;
             };
-            let app: AppConfig = match arg_value(&args, "--app-config")
-                .ok_or_else(|| "missing --app-config".to_string())
-                .and_then(|json| serde_json::from_str(json).map_err(|e| e.to_string()))
-            {
-                Ok(app) => app,
-                Err(e) => {
-                    eprintln!("buran-php: bad app config: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            prototype::run(fd, work_fd, app)
+            // The app config arrives over the control socket, not argv (keeps
+            // ini secrets out of /proc/<pid>/cmdline) — see prototype::run.
+            prototype::run(fd, work_fd)
         }
         Some("--channel") => {
             let Some(fd) = args.get(1).and_then(|v| v.parse::<i32>().ok()) else {

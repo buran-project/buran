@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use buran_config::Validated;
-use tracing::{error, info};
+use tracing::info;
 
 mod spawn;
 
@@ -26,21 +26,42 @@ Usage:
 ";
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
+    // Logging is initialised inside `run()`, after the config is read, so its
+    // destination can honour `error_log`. A failure here therefore predates the
+    // logger — print straight to stderr so it is never swallowed.
     match run() {
         Ok(code) => code,
         Err(e) => {
-            error!("{e:#}");
+            eprintln!("buran: {e:#}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Initialise the diagnostic log: non-blocking (a background writer drains a
+/// bounded queue, so logging never blocks the hot path and drops under
+/// backpressure rather than stalling). Writes to `error_log` if given, else
+/// stderr. The returned guard flushes on drop and must outlive the program.
+fn init_tracing(error_log: Option<&str>) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    let (writer, guard) = match error_log {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("cannot open error_log {path}"))?;
+            tracing_appender::non_blocking(file)
+        }
+        None => tracing_appender::non_blocking(std::io::stderr()),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(error_log.is_none()) // no colour escapes in a log file
+        .init();
+    Ok(guard)
 }
 
 struct Cli {
@@ -84,6 +105,17 @@ fn run() -> anyhow::Result<ExitCode> {
 
     let validated = buran_config::from_file(&cli.config)
         .with_context(|| format!("config {}", cli.config.display()))?;
+
+    // Utility modes (--check-config, --modules) log to stderr and never open
+    // the configured error_log file, so validation stays a pure gate that does
+    // not depend on the log directory existing. Only the running server honours
+    // error_log. The guard must live for the whole program (flush on exit).
+    let error_log = if cli.check || cli.modules {
+        None
+    } else {
+        validated.config.error_log.as_deref()
+    };
+    let _log_guard = init_tracing(error_log)?;
 
     if cli.modules {
         list_modules(&validated)?;

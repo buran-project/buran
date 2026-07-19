@@ -57,9 +57,18 @@ pub fn from_file(path: &std::path::Path) -> Result<Validated, ConfigError> {
 /// serde_norway silently expands aliases, so we scan the raw text upfront.
 fn reject_anchors(yaml: &str) -> Result<(), ConfigError> {
     for (i, line) in yaml.lines().enumerate() {
-        let code = match line.find(" #") {
-            Some(pos) => &line[..pos],
-            None => line,
+        // Strip comments before scanning: a whole-line comment (`#` as the
+        // first non-blank char, at any indent) is dropped entirely; otherwise
+        // an inline ` #` comment is trimmed. Without the whole-line case a
+        // column-0 comment containing `*`/`&` after whitespace (e.g. a
+        // "`*` = wildcard" note) would be mis-scanned as an alias/anchor.
+        let code = if line.trim_start().starts_with('#') {
+            ""
+        } else {
+            match line.find(" #") {
+                Some(pos) => &line[..pos],
+                None => line,
+            }
         };
         // Quick scan: `&name` / `*name` tokens outside of quoted scalars. An
         // anchor/alias sits at a node position: after whitespace in block
@@ -195,6 +204,78 @@ routes:
     - action:
         return: 302
         location: \"/a &b\"
+";
+        assert!(from_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn star_or_amp_in_a_whole_line_comment_is_allowed() {
+        // A whole-line comment (column 0 or indented) is not code: `*`/`&`
+        // after whitespace inside it must not be mistaken for an alias/anchor.
+        let yaml = "\
+# glob syntax: * matches a path segment, & is just prose
+listeners:
+  \"*:8080\":
+    route: main
+routes:
+  main:
+    # note: use * for wildcards here
+    - action:
+        return: 200
+";
+        assert!(from_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn catch_all_step_before_others_is_rejected() {
+        // A match-less step matches everything; a later step is dead code.
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action: { return: 200 }
+    - match: { uri: \"/x\" }
+      action: { return: 404 }
+";
+        match err(yaml) {
+            ConfigError::Invalid { path, .. } => assert!(path.ends_with("main[0]"), "path: {path}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_sources_with_application_fallback_is_rejected() {
+        // Serving source raw from a share that falls back to an app would leak
+        // the app's own source — refuse the combination.
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action:
+        share: { share: /www$uri, serve_sources: true }
+        fallback: { application: app }
+applications:
+  app: { module: test }
+";
+        match err(yaml) {
+            ConfigError::Invalid { path, .. } => assert!(path.ends_with(".share"), "path: {path}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_sources_list_without_app_fallback_is_allowed() {
+        // A scoped opt-out (only .php) with a non-application fallback is fine.
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action:
+        share: { share: /www$uri, serve_sources: [\".php\"] }
+        fallback: { return: 404 }
 ";
         assert!(from_str(yaml).is_ok());
     }

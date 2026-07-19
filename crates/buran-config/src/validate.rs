@@ -86,6 +86,17 @@ pub fn validate(mut config: Config) -> Result<Validated, ConfigError> {
             return Err(ConfigError::invalid(format!("routes.{name}"), "route has no steps"));
         }
         for (i, step) in steps.iter().enumerate() {
+            // A step with no `match` matches everything, so any step after it is
+            // unreachable dead code — almost always an ordering mistake (a broad
+            // catch-all placed before a narrower guard). Reject it rather than
+            // silently shadow the later rules.
+            if step.match_.is_none() && i + 1 < steps.len() {
+                return Err(ConfigError::invalid(
+                    format!("routes.{name}[{i}]"),
+                    "a step with no \"match\" matches everything and must be last in its \
+                     route; the steps after it are unreachable",
+                ));
+            }
             validate_action(
                 &step.action,
                 &format!("routes.{name}[{i}].action"),
@@ -223,12 +234,36 @@ fn validate_action(
         ));
     }
 
+    // Serving a module's source raw from a share that also falls back to an
+    // application would expose that application's own source — they share the
+    // file tree. Refuse the combination; serve example sources from a separate
+    // share that has no application fallback instead.
+    if let Some(Share::Full(opts)) = &action.share
+        && opts.serve_sources.is_enabled()
+        && action.fallback.as_deref().is_some_and(action_reaches_application)
+    {
+        return Err(ConfigError::invalid(
+            format!("{path}.share"),
+            "\"serve_sources\" cannot be combined with a fallback that reaches an \
+             application: it would serve that application's source. Use a separate \
+             share with no application fallback for downloadable sources",
+        ));
+    }
+
     // A fallback is a full action: it may re-enter routing via `route`.
     if let Some(fallback) = &action.fallback {
         validate_action(fallback, &format!("{path}.fallback"), routes, applications)?;
     }
 
     Ok(())
+}
+
+/// Does this action, or its share fallback chain, terminate in an application?
+/// Route jumps are not followed — only the direct fallback chain, which shares
+/// the file tree of a source-serving share.
+fn action_reaches_application(action: &Action) -> bool {
+    action.application.is_some()
+        || action.fallback.as_deref().is_some_and(action_reaches_application)
 }
 
 fn validate_application(app: &Application, path: &str) -> Result<(), ConfigError> {

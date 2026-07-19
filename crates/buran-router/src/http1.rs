@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::tcp::OwnedReadHalf;
@@ -162,11 +162,14 @@ pub async fn serve_connection(
     let mut rd = Some(rd);
 
     // settings.http (spec 2.8): idle_timeout while waiting for a request on
-    // a keep-alive connection, header_read_timeout once bytes arrive,
-    // body_read_timeout between body reads, send_timeout between writes.
+    // a keep-alive connection; header_read_timeout is a single wall-clock
+    // budget for the WHOLE header block once the first byte arrives (not a
+    // per-read idle timer — that would let a client dribble bytes forever;
+    // slowloris); body_read_timeout between body reads, send_timeout writes.
     let idle_timeout = Duration::from_secs(state.http.idle_timeout);
     let header_timeout = Duration::from_secs(state.http.header_read_timeout);
     let body_timeout = Duration::from_secs(state.http.body_read_timeout);
+    let min_body_rate = state.http.min_body_rate;
     let send_timeout = Duration::from_secs(state.http.send_timeout);
     let max_body = state.http.max_body_size;
 
@@ -179,6 +182,12 @@ pub async fn serve_connection(
     let remote = peer.ip().to_string();
 
     loop {
+        // Deadline for the whole header block of the next request. `None`
+        // until the first byte arrives: a kept-alive connection may sit idle
+        // (bounded by idle_timeout), but once a request starts the entire
+        // header block must land within one header_timeout window regardless
+        // of how the bytes are paced.
+        let mut header_deadline: Option<Instant> = None;
         // Read until end of headers.
         let headers_end = loop {
             if let Some(pos) = find_headers_end(&buf) {
@@ -188,7 +197,13 @@ pub async fn serve_connection(
                 write_simple(&mut wr, 431, "Request Header Fields Too Large", false).await?;
                 return Ok(());
             }
-            let timeout = if buf.is_empty() { idle_timeout } else { header_timeout };
+            let timeout = match header_deadline {
+                None => idle_timeout, // waiting for the request's first byte
+                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                    Some(remaining) => remaining,
+                    None => return Ok(()), // header budget spent, close quietly
+                },
+            };
             let mut chunk = [0u8; 8 * 1024];
             // On shutdown, close idle keep-alive connections right away so
             // the drain does not wait out their idle_timeout.
@@ -202,6 +217,10 @@ pub async fn serve_connection(
             };
             if n == 0 {
                 return Ok(()); // clean close between requests
+            }
+            if header_deadline.is_none() {
+                // First bytes of this request: start the wall-clock budget.
+                header_deadline = Some(Instant::now() + header_timeout);
             }
             buf.extend_from_slice(&chunk[..n]);
         };
@@ -229,6 +248,15 @@ pub async fn serve_connection(
 
         let (path, query) = split_target(&parsed.target);
         let path = crate::uri::normalize_path(path);
+        // normalize_path percent-decodes, so `%0d`/`%0a`/`%00` and other control
+        // bytes in the raw target (which httparse accepts as valid target bytes)
+        // become real control bytes here. Reject them before the decoded path
+        // can reach a response header (the directory-redirect `Location`) or a
+        // worker's $_SERVER — a response-splitting / header-injection sink.
+        if path.iter().any(|&b| b < 0x20 || b == 0x7f) {
+            write_simple(&mut wr, 400, "Bad Request", false).await?;
+            return Ok(());
+        }
         let query = query.to_vec();
         let keep_alive = parsed.keep_alive;
 
@@ -272,7 +300,7 @@ pub async fn serve_connection(
         let mut body: Vec<u8> = Vec::new();
         if !streams {
             let reader = rd.as_mut().expect("read half present between requests");
-            match take_body(reader, &mut buf, parsed.content_length, body_timeout).await {
+            match take_body(reader, &mut buf, parsed.content_length, body_timeout, min_body_rate).await {
                 Ok(b) => body = b,
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     write_simple(&mut wr, 408, "Request Timeout", false).await?;
@@ -287,10 +315,17 @@ pub async fn serve_connection(
 
         let status: u16 = match (&kind, outcome) {
             (ListenerKind::Status, _) => {
-                // /health: liveness probe; anything else: pool metrics.
-                let body = if path == b"/health" {
-                    "{\"status\":\"ok\"}\n".to_string()
-                } else {
+                // Serve only explicit, documented paths — never dump internals
+                // on an arbitrary path. `/health` is a public liveness probe;
+                // per-application pool metrics live under `/health/applications`
+                // (topology/occupancy an attacker could use to time a flood);
+                // anything else is 404, not a metrics leak.
+                if path == b"/health" {
+                    let body = "{\"status\":\"ok\"}\n";
+                    write_response(&mut wr, 200, "application/json", body.as_bytes(), &[], keep_alive)
+                        .await?;
+                    200
+                } else if path == b"/health/applications" {
                     let mut apps = String::new();
                     for (i, (name, pool)) in state.pools.iter().enumerate() {
                         let s = pool.stats();
@@ -302,11 +337,16 @@ pub async fn serve_connection(
                             s.workers, s.idle, s.queued
                         ));
                     }
-                    format!("{{\"status\":\"ok\",\"applications\":{{{apps}}}}}\n")
-                };
-                write_response(&mut wr, 200, "application/json", body.as_bytes(), &[], keep_alive)
-                    .await?;
-                200
+                    let body = format!("{{\"status\":\"ok\",\"applications\":{{{apps}}}}}\n");
+                    write_response(&mut wr, 200, "application/json", body.as_bytes(), &[], keep_alive)
+                        .await?;
+                    200
+                } else {
+                    let body = "{\"error\":\"not found\"}\n";
+                    write_response(&mut wr, 404, "application/json", body.as_bytes(), &[], keep_alive)
+                        .await?;
+                    404
+                }
             }
             (ListenerKind::Route(_), Some(outcome)) => {
                 // A fired rewrite replaces path+query for the terminal;
@@ -389,6 +429,7 @@ pub async fn serve_connection(
                                 rd: rd.take().expect("read half present"),
                                 total: parsed.content_length,
                                 read_timeout: body_timeout,
+                                min_rate: min_body_rate,
                             }
                         } else {
                             BodyPlan::Buffered(&body)
@@ -527,12 +568,15 @@ async fn read_exact_body(
     body: &mut Vec<u8>,
     content_length: u64,
     read_timeout: Duration,
+    min_rate: u64,
 ) -> std::io::Result<()> {
     let mut chunk = [0u8; 16 * 1024];
+    let started = Instant::now();
     while (body.len() as u64) < content_length {
         let want = ((content_length - body.len() as u64) as usize).min(chunk.len());
-        // body_read_timeout budgets each read, not the whole body: a slow
-        // but moving upload is fine, a stalled one gets cut.
+        // body_read_timeout budgets each read (a hard stall is cut fast); the
+        // min_body_rate floor additionally cuts a slow-but-moving dribble
+        // (slow-POST / RUDY) that inflates Content-Length to buy a long hold.
         let n = tokio::time::timeout(read_timeout, rd.read(&mut chunk[..want]))
             .await
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
@@ -540,8 +584,22 @@ async fn read_exact_body(
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
         body.extend_from_slice(&chunk[..n]);
+        if !body_rate_ok(body.len() as u64, started.elapsed(), read_timeout, min_rate) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
     }
     Ok(())
+}
+
+/// Sustained minimum body throughput (slow-POST / RUDY defence). Within the
+/// initial `grace` window any pace is allowed (connection setup, TCP slow
+/// start); after it, the client must have delivered at least `min_rate` bytes
+/// per elapsed second or the body read is cut. `min_rate == 0` disables it.
+fn body_rate_ok(received: u64, elapsed: Duration, grace: Duration, min_rate: u64) -> bool {
+    if min_rate == 0 {
+        return true;
+    }
+    elapsed <= grace || received >= min_rate.saturating_mul(elapsed.as_secs())
 }
 
 /// How the request body reaches the application dispatch.
@@ -558,6 +616,7 @@ enum BodyPlan<'a> {
         /// Full body size (content-length).
         total: u64,
         read_timeout: Duration,
+        min_rate: u64,
     },
 }
 
@@ -680,7 +739,7 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
                 builder.preread_body(bytes);
             }
         }
-        BodyPlan::Streamed { initial, rd, total, read_timeout } => {
+        BodyPlan::Streamed { initial, rd, total, read_timeout, min_rate } => {
             builder.content_length(total).preread_body(&[]);
             let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
             submit_body = SubmitBody::Stream(rx);
@@ -691,7 +750,7 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
             // worker's stream.
             feed = Some(tokio::spawn(async move {
                 let mut rd = rd;
-                let ok = feed_body(&mut rd, initial, remaining, read_timeout, tx).await;
+                let ok = feed_body(&mut rd, initial, remaining, read_timeout, min_rate, tx).await;
                 (rd, ok)
             }));
         }
@@ -808,6 +867,13 @@ async fn dispatch_to_app<W: AsyncWriteExt + Unpin>(
     for line in worker_headers.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() || framing_header(line) {
+            continue;
+        }
+        // Defense in depth: a well-formed header carries no control bytes (PHP's
+        // header() already blocks CR/LF; this guards a buggy or non-PHP module).
+        // Drop a line with an interior control byte rather than forward a
+        // header-injection primitive to the client.
+        if line.iter().any(|&b| b < 0x20 || b == 0x7f) {
             continue;
         }
         let name_end = memchr::memchr(b':', line).unwrap_or(line.len());
@@ -982,6 +1048,11 @@ async fn write_101<W: AsyncWriteExt + Unpin>(
         if line.is_empty() || framing_header(line) || handshake_header(line) {
             continue;
         }
+        // Defense in depth: drop a line with an interior control byte (see the
+        // response path) rather than forward a header-injection primitive.
+        if line.iter().any(|&b| b < 0x20 || b == 0x7f) {
+            continue;
+        }
         head.push_str(&String::from_utf8_lossy(line));
         head.push_str("\r\n");
     }
@@ -1117,13 +1188,14 @@ async fn take_body(
     buf: &mut Vec<u8>,
     content_length: u64,
     read_timeout: Duration,
+    min_rate: u64,
 ) -> std::io::Result<Vec<u8>> {
     let mut body = std::mem::take(buf);
     if body.len() as u64 > content_length {
         *buf = body.split_off(content_length as usize);
         return Ok(body);
     }
-    read_exact_body(rd, &mut body, content_length, read_timeout).await?;
+    read_exact_body(rd, &mut body, content_length, read_timeout, min_rate).await?;
     Ok(body)
 }
 
@@ -1136,21 +1208,28 @@ async fn feed_body(
     initial: Vec<u8>,
     mut remaining: u64,
     read_timeout: Duration,
+    min_rate: u64,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> bool {
+    let total = remaining + initial.len() as u64;
     if !initial.is_empty() && tx.send(initial).await.is_err() {
         return remaining == 0;
     }
+    let started = Instant::now();
     let mut chunk = [0u8; 16 * 1024];
     while remaining > 0 {
         let want = (remaining as usize).min(chunk.len());
-        // read_timeout budgets each read, not the whole body: a slow but
-        // moving upload is fine, a stalled one gets cut.
+        // read_timeout budgets each read (a hard stall is cut fast); the
+        // min_body_rate floor additionally cuts a slow-but-moving dribble
+        // (slow-POST / RUDY) — which for a streaming pool also pins a worker.
         let n = match tokio::time::timeout(read_timeout, rd.read(&mut chunk[..want])).await {
             Ok(Ok(n)) if n > 0 => n,
             _ => return false, // stall, clean EOF mid-body, or error
         };
         remaining -= n as u64;
+        if !body_rate_ok(total - remaining, started.elapsed(), read_timeout, min_rate) {
+            return false;
+        }
         if tx.send(chunk[..n].to_vec()).await.is_err() {
             return false;
         }
@@ -1524,7 +1603,7 @@ Sec-WebSocket-Version: 13\r\n\r\n";
     async fn take_body_splits_pipelined_bytes() {
         let (_client, mut rd) = tcp_pair().await;
         let mut buf = b"bodyNEXT REQUEST".to_vec();
-        let body = take_body(&mut rd, &mut buf, 4, Duration::from_secs(1)).await.unwrap();
+        let body = take_body(&mut rd, &mut buf, 4, Duration::from_secs(1), 0).await.unwrap();
         assert_eq!(body, b"body");
         assert_eq!(buf, b"NEXT REQUEST");
     }
@@ -1538,7 +1617,7 @@ Sec-WebSocket-Version: 13\r\n\r\n";
             client.write_all(b"tial").await.unwrap();
             client
         };
-        let read = take_body(&mut rd, &mut buf, 7, Duration::from_secs(5));
+        let read = take_body(&mut rd, &mut buf, 7, Duration::from_secs(5), 0);
         let (_client, body) = tokio::join!(write, read);
         assert_eq!(body.unwrap(), b"partial");
         assert!(buf.is_empty());
@@ -1554,7 +1633,7 @@ Sec-WebSocket-Version: 13\r\n\r\n";
             client.write_all(b"-from-socket").await.unwrap();
             client
         };
-        let feed = feed_body(&mut rd, b"initial".to_vec(), 12, Duration::from_secs(5), tx);
+        let feed = feed_body(&mut rd, b"initial".to_vec(), 12, Duration::from_secs(5), 0, tx);
         let (ok, _client) = tokio::join!(feed, write);
         assert!(ok, "body fully delivered");
 
@@ -1570,8 +1649,22 @@ Sec-WebSocket-Version: 13\r\n\r\n";
         let (client, mut rd) = tcp_pair().await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         drop(client); // EOF with 10 bytes still owed
-        let ok = feed_body(&mut rd, Vec::new(), 10, Duration::from_secs(5), tx).await;
+        let ok = feed_body(&mut rd, Vec::new(), 10, Duration::from_secs(5), 0, tx).await;
         assert!(!ok, "short body must poison the connection");
         assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn body_rate_floor_grace_then_cutoff() {
+        let grace = Duration::from_secs(30);
+        // Within the grace window any pace passes, even zero bytes.
+        assert!(body_rate_ok(0, Duration::from_secs(5), grace, 256));
+        // A disabled floor (0) always passes, even a long stall past grace.
+        assert!(body_rate_ok(1, Duration::from_secs(120), grace, 0));
+        // Past grace, below the floor: cut (a 1-byte-per-120s dribble).
+        assert!(!body_rate_ok(1, Duration::from_secs(120), grace, 256));
+        // Boundary: exactly min_rate * elapsed passes, one byte short fails.
+        assert!(body_rate_ok(30_720, Duration::from_secs(120), grace, 256));
+        assert!(!body_rate_ok(30_719, Duration::from_secs(120), grace, 256));
     }
 }

@@ -3,7 +3,9 @@
 //! One prototype process per application boots the module runtime once
 //! (for PHP: opcache SHM is created there) and forks warm workers on
 //! command. The supervisor talks to the prototype over a control channel:
-//! one byte per spawn, the worker fd attached via SCM_RIGHTS.
+//! the length-prefixed app-config JSON is sent first, then one byte per spawn
+//! (the worker fd attached via SCM_RIGHTS). The config travels here rather than
+//! on argv so `${ENV}`-substituted ini secrets stay out of `/proc/<pid>/cmdline`.
 
 use std::io::{IoSlice, Write};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
@@ -193,8 +195,7 @@ impl PrototypeSpawner {
             .arg(CONTROL_FD.to_string())
             .arg("--work")
             .arg(WORK_FD.to_string())
-            .arg("--app-config")
-            .arg(&self.app_config)
+            // The app config is NOT passed on argv (see send_app_config below).
             // The prototype and every forked worker share these pipes:
             // one reader per application routes them into the error log.
             .stdout(std::process::Stdio::piped())
@@ -223,6 +224,14 @@ impl PrototypeSpawner {
             .spawn()
             .with_context(|| format!("spawn prototype {}", self.module_binary.display()))?;
         libc_close(theirs_fd);
+
+        // Hand the app config to the prototype over the control socket, not
+        // argv: ini values may carry ${ENV}-substituted secrets and argv is
+        // world-readable via /proc/<pid>/cmdline. The control socket is private
+        // to the supervisor and this prototype.
+        send_app_config(&control, &self.app_config).with_context(|| {
+            format!("sending app config to prototype {}", self.module_binary.display())
+        })?;
 
         if let Some(out) = child.stdout.take() {
             forward_output(self.app_name.clone(), "stdout", out);
@@ -290,6 +299,18 @@ fn send_kill(control: &StdUnixStream, token: u64) -> std::io::Result<()> {
     msg[0] = CMD_KILL;
     msg[1..9].copy_from_slice(&token.to_le_bytes());
     (&mut &*control).write_all(&msg)
+}
+
+/// The app config sent once over the control socket before any spawn command:
+/// a u32 little-endian length prefix followed by the JSON. Kept off argv so
+/// `${ENV}`-substituted ini secrets never leak via `/proc/<pid>/cmdline`.
+fn send_app_config(control: &StdUnixStream, json: &str) -> std::io::Result<()> {
+    let bytes = json.as_bytes();
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "app config too large")
+    })?;
+    (&mut &*control).write_all(&len.to_le_bytes())?;
+    (&mut &*control).write_all(bytes)
 }
 
 /// Returns the spawner, the router end of the shared work socket (the

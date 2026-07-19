@@ -185,10 +185,12 @@ pub struct Pool {
     /// Capabilities declared by this pool's workers (same homogeneity).
     caps: AtomicU32,
     workers: Mutex<HashMap<u32, Arc<WorkerState>>>,
-    /// In-flight liveness probes: request_id -> one-shot for the `Pong` status
-    /// (`PONG_IDLE`/`PONG_BUSY`). The sweep registers one before a `Ping`; the
-    /// reader completes it when the matching `Pong` arrives.
-    pings: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<u32>>>,
+    /// In-flight liveness probes: (worker_id, task_id) -> one-shot for the
+    /// `Pong` status (`PONG_IDLE`/`PONG_BUSY`). The sweep registers one before a
+    /// `Ping`; only the *probed* worker's reader may complete it. Keying by
+    /// worker as well as task stops one worker answering another's probe — a
+    /// forged `Pong: idle` would otherwise spare a wedged worker from the kill.
+    pings: Mutex<HashMap<(u32, u32), tokio::sync::oneshot::Sender<u32>>>,
 }
 
 /// Payload larger than this spills to a temp file (datagram size budget)
@@ -387,13 +389,24 @@ impl Pool {
             }
         };
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        fh.request_id = id;
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        self.pending
-            .lock()
-            .expect("pending lock")
-            .insert(
+        let id = {
+            let mut pending = self.pending.lock().expect("pending lock");
+            // Allocate a request id not already in flight. `next_id` is a u32
+            // that wraps after 2^32 submits; skipping ids still present in
+            // `pending` stops a wrapped counter from colliding with a live,
+            // long-running request (SSE / WebSocket / post-finish_request
+            // background task) — a collision would overwrite that request's
+            // slot and cross-deliver its frames to the wrong client. `pending`
+            // is bounded by pool concurrency, so this spins at most a handful
+            // of times.
+            let id = loop {
+                let candidate = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if !pending.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            pending.insert(
                 id,
                 Pending {
                     events: tx,
@@ -404,6 +417,9 @@ impl Pool {
                     body: body_rx,
                 },
             );
+            id
+        };
+        fh.request_id = id;
         self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
 
         let mut msg = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
@@ -518,15 +534,16 @@ impl Pool {
     async fn probe(&self, worker_id: u32, task_id: u32, deadline: Duration) -> Option<u32> {
         let worker = self.workers.lock().expect("workers lock").get(&worker_id).cloned()?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pings.lock().expect("pings lock").insert(task_id, tx);
+        let key = (worker_id, task_id);
+        self.pings.lock().expect("pings lock").insert(key, tx);
         if worker.send_frame(&FrameHeader::new(FrameKind::Ping, task_id, 0), &[]).await.is_err() {
-            self.pings.lock().expect("pings lock").remove(&task_id);
+            self.pings.lock().expect("pings lock").remove(&key);
             return None;
         }
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(status)) => Some(status),
             _ => {
-                self.pings.lock().expect("pings lock").remove(&task_id);
+                self.pings.lock().expect("pings lock").remove(&key);
                 None
             }
         }
@@ -638,8 +655,30 @@ async fn handshake(
         u32::MAX => DEFAULT_CONCURRENCY_CAP,
         n => n,
     };
-    pool.granted.store(granted, Ordering::Relaxed);
-    pool.caps.store(hello.capabilities, Ordering::Relaxed);
+    // Workers of a pool are homogeneous by design, so the FIRST handshake seeds
+    // the pool-wide concurrency and capability values and later ones must not
+    // change them: a divergent late worker (a bug, or a hostile module) would
+    // otherwise resize the whole pool's capacity math or flip capability bits
+    // (body-streaming / websocket) mid-flight. `granted` is always >= 1, so 0
+    // is the "unset" sentinel; seed once, then reuse the seeded value.
+    let granted = match pool.granted.compare_exchange(0, granted, Ordering::Relaxed, Ordering::Relaxed)
+    {
+        Ok(_) => {
+            pool.caps.store(hello.capabilities, Ordering::Relaxed);
+            granted
+        }
+        Err(seeded) => {
+            if seeded != granted || pool.caps.load(Ordering::Relaxed) != hello.capabilities {
+                warn!(
+                    worker = %name,
+                    "worker profile (granted {granted}, caps {}) differs from the pool's seeded \
+                     values (granted {seeded}); using the pool's",
+                    hello.capabilities,
+                );
+            }
+            seeded
+        }
+    };
 
     let ack = HelloAck { version: BWP_VERSION, concurrency: granted }.encode();
     let worker = Arc::new(WorkerState {
@@ -684,20 +723,42 @@ async fn reader_task(
         };
 
         let id = header.request_id;
+
+        // A worker may only address a request it actually claimed. The kernel
+        // hands each queued datagram to exactly one worker, but nothing in the
+        // frame binds a response to its claimer — so without this gate a buggy
+        // or compromised worker could emit frames carrying another client's
+        // `request_id` and steal or overwrite that client's response, free its
+        // slot, or pump it a foreign body. `Claim` is the sole request-scoped
+        // arm allowed for an id we do not yet own; `Log`/`Pong` are pool-global
+        // (not request-scoped). Everything else is dropped unless the id is in
+        // this worker's `claimed` set.
+        if !matches!(header.kind, FrameKind::Claim | FrameKind::Log | FrameKind::Pong)
+            && !claimed.contains(&id)
+        {
+            continue;
+        }
+
         let event = match header.kind {
             FrameKind::Claim => {
-                claimed.insert(id);
                 let body = {
                     let mut pending = pool.pending.lock().expect("pending lock");
                     match pending.get_mut(&id) {
-                        Some(p) => {
+                        // First-writer-wins: only an unclaimed pending request
+                        // can be claimed, and only once. A duplicate/replayed
+                        // or poached `Claim` for an already-owned id is ignored
+                        // — it must not reset `claimed_at` (which would let a
+                        // worker dodge the task_timeout sweep by re-claiming) or
+                        // steal the body receiver from the real owner.
+                        Some(p) if p.claimed_by.is_none() => {
                             p.claimed_by = Some(worker_id);
                             p.claimed_at = Some(Instant::now()); // task_timeout starts
+                            claimed.insert(id);
                             p.body.take()
                         }
-                        // Already abandoned (timeout/disconnect before the
-                        // claim): the worker serves it into the void.
-                        None => None,
+                        // Already claimed, or abandoned (timeout/disconnect
+                        // before the claim): the worker serves it into the void.
+                        _ => None,
                     }
                 };
                 if let Some(rx) = body {
@@ -743,9 +804,11 @@ async fn reader_task(
                 info!("worker: {}", String::from_utf8_lossy(&payload));
                 continue;
             }
-            // Liveness reply: complete the sweep's probe with the status.
+            // Liveness reply: complete the sweep's probe with the status, but
+            // only the probe registered for THIS worker — a `Pong` cannot
+            // satisfy (or cancel) another worker's probe.
             FrameKind::Pong => {
-                if let Some(tx) = pool.pings.lock().expect("pings lock").remove(&id) {
+                if let Some(tx) = pool.pings.lock().expect("pings lock").remove(&(worker_id, id)) {
                     let _ = tx.send(header.aux);
                 }
                 continue;
@@ -1181,6 +1244,37 @@ applications:
         match timeout(TICK, rs.next_event()).await.unwrap() {
             Some(WorkerEvent::Chunk(c)) => assert_eq!(c, b"tick"),
             _ => panic!("expected chunk"),
+        }
+        assert!(matches!(timeout(TICK, rs.next_event()).await.unwrap(), Some(WorkerEvent::End)));
+    }
+
+    #[tokio::test]
+    async fn worker_cannot_answer_a_request_it_never_claimed() {
+        // Cross-request response mixing (H1): responses are demuxed by
+        // request_id, so a buggy/compromised worker must not address an id it
+        // never claimed. A pre-claim ResponseHeaders is dropped; only frames
+        // after a valid Claim reach the client.
+        let mut r = rig(Some(1), 1, 0).await;
+        let mut rs = r
+            .pool
+            .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+            .await
+            .unwrap();
+        let id = wk_recv_work(&r.work).await.request_id;
+
+        // Rogue frame for the still-unclaimed id: must be gated out.
+        wk_send(&mut r.stream, FrameKind::ResponseHeaders, id, 500, b"").await;
+        // Legitimate claim, then the real response for the same id.
+        wk_send(&mut r.stream, FrameKind::Claim, id, 0, &[]).await;
+        wk_send(&mut r.stream, FrameKind::ResponseHeaders, id, 200, b"").await;
+        wk_send(&mut r.stream, FrameKind::End, id, 0, &[]).await;
+
+        // The client sees only the post-claim 200 — the pre-claim 500 was dropped.
+        match timeout(TICK, rs.next_event()).await.unwrap() {
+            Some(WorkerEvent::Headers { status, .. }) => {
+                assert_eq!(status, 200, "pre-claim response frame must be dropped");
+            }
+            _ => panic!("expected 200 headers after the valid claim"),
         }
         assert!(matches!(timeout(TICK, rs.next_event()).await.unwrap(), Some(WorkerEvent::End)));
     }

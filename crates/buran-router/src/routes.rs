@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use buran_config::{Action as ConfAction, Application, ApplicationRef, Match, OneOrMany, Share, Validated};
+use buran_config::{
+    Action as ConfAction, Application, ApplicationRef, Match, OneOrMany, ServeSources, Share,
+    Validated,
+};
 
 use crate::matching::{CidrSet, PatternSet};
 use crate::template::Template;
@@ -40,8 +43,8 @@ pub enum Action {
         /// Follow symlinks during resolution (default true). When false,
         /// paths resolving through a symlink are refused.
         follow_symlinks: bool,
-        /// Opt-out of module source-leak protection.
-        serve_sources: bool,
+        /// Opt-out of module source-leak protection (none / all / a list).
+        serve_sources: ServeSources,
         /// Per-app `execute` extensions of the fallback application
         /// (lowercase, no dot): forbidden for this share specifically.
         extra_source_exts: Vec<String>,
@@ -58,7 +61,7 @@ pub enum Decision<'r> {
         index: &'r str,
         types: Option<&'r PatternSet>,
         follow_symlinks: bool,
-        serve_sources: bool,
+        serve_sources: &'r ServeSources,
         extra_source_exts: &'r [String],
         fallback: Option<&'r Action>,
     },
@@ -167,7 +170,9 @@ fn compile_action(
     }
     if let Some(share) = &action.share {
         let (template, index, types, follow_symlinks, serve_sources) = match share {
-            Share::Path(p) => (p.clone(), "index.html".to_string(), None, true, false),
+            Share::Path(p) => {
+                (p.clone(), "index.html".to_string(), None, true, ServeSources::None)
+            }
             Share::Full(opts) => (
                 opts.share.iter().next().cloned().unwrap_or_default(),
                 opts.index.clone().unwrap_or_else(|| "index.html".to_string()),
@@ -176,7 +181,7 @@ fn compile_action(
                     .map(|t| PatternSet::compile(t.iter().map(String::as_str), true))
                     .transpose()?,
                 opts.follow_symlinks.unwrap_or(true),
-                opts.serve_sources,
+                opts.serve_sources.clone(),
             ),
         };
         let fallback = action
@@ -276,7 +281,7 @@ impl CompiledRoutes {
                     index,
                     types: types.as_ref(),
                     follow_symlinks: *follow_symlinks,
-                    serve_sources: *serve_sources,
+                    serve_sources,
                     extra_source_exts,
                     fallback: fallback.as_deref(),
                 },

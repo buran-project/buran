@@ -402,6 +402,15 @@ fn read_hello_ack(stream: &mut UnixStream) -> Result<HelloAck, WorkerError> {
     }
     // Grow with the data; a bogus payload_len hits EOF rather than pre-allocating.
     let want = u64::from(header.payload_len);
+    // A HelloAck is a handful of bytes; reject an absurd length up front so a
+    // misbehaving router cannot make the worker buffer up to ~4 GiB.
+    const MAX_HELLO_ACK: u64 = 4096;
+    if want > MAX_HELLO_ACK {
+        return Err(std::io::Error::other(format!(
+            "handshake: HelloAck payload {want} exceeds {MAX_HELLO_ACK}"
+        ))
+        .into());
+    }
     let mut payload = Vec::new();
     if (&mut *stream).take(want).read_to_end(&mut payload)? as u64 != want {
         return Err(WorkerError::Closed);

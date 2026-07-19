@@ -146,11 +146,22 @@ impl Cidr {
     }
 }
 
+/// Compile a route regex with a bounded compiled program and lazy-DFA cache.
+/// The `regex` crate is already linear-time on input (no catastrophic
+/// backtracking); this caps compilation memory so a pathological operator
+/// pattern matched against attacker-controlled input cannot blow up space.
+fn build_bounded_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    regex::bytes::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+}
+
 impl Pattern {
     fn compile(body: &str, case_insensitive: bool) -> anyhow::Result<Self> {
         if let Some(re) = body.strip_prefix('~') {
             let re = if case_insensitive { format!("(?i){re}") } else { re.to_string() };
-            return Ok(Self::Regex(Regex::new(&re)?));
+            return Ok(Self::Regex(build_bounded_regex(&re)?));
         }
 
         let body = if case_insensitive { body.to_ascii_lowercase() } else { body.to_string() };
@@ -174,7 +185,7 @@ impl Pattern {
                     .map(|part| regex::escape(&String::from_utf8_lossy(part)))
                     .collect::<Vec<_>>()
                     .join(".*");
-                Self::Regex(Regex::new(&format!("^{escaped}$"))?)
+                Self::Regex(build_bounded_regex(&format!("^{escaped}$"))?)
             }
         })
     }
