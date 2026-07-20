@@ -94,8 +94,21 @@ fn responder<'a>(ctx: &mut RequestCtx) -> &'a mut Responder<'static> {
 /// the only stage where zend_extensions (opcache) can be loaded. The
 /// admin/user distinction (PHP_INI_SYSTEM vs ini_set-able) is phase 2.
 pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
-    let ini = app.ini_file.as_deref().map(|p| CString::new(p).unwrap());
-    let ini_ptr = ini.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    // The engine stores this pointer in the process-global SAPI module
+    // (`php_ini_path_override`) and reads it during startup — and potentially
+    // again later — so it must live for the whole process. Leak the CString
+    // deliberately, exactly like `entries_ptr` below: a local would leave a
+    // dangling pointer in the SAPI struct the moment boot() returns.
+    let ini_ptr = match app.ini_file.as_deref() {
+        None => std::ptr::null(),
+        Some(p) => {
+            let c = CString::new(p)
+                .map_err(|_| std::io::Error::other("ini_file path contains a NUL byte"))?;
+            let ptr = c.as_ptr();
+            std::mem::forget(c);
+            ptr
+        }
+    };
 
     let mut entries = String::new();
     for (name, value) in app.admin.iter().chain(app.user.iter()) {
@@ -135,22 +148,17 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
 /// Serve requests on an already-booted engine. Forked workers land here;
 /// they exit without engine shutdown (FPM practice — the request boundary
 /// is `php_request_startup/shutdown`, the process just dies).
-pub fn serve(
-    work: &UnixDatagram,
-    stream: UnixStream,
-    app: &AppConfig,
-    token: u64,
-) -> Result<(), WorkerError> {
+pub fn serve(work: &UnixDatagram, stream: UnixStream, app: &AppConfig) -> Result<(), WorkerError> {
     let work = work.try_clone()?;
-    buran_worker::run(work, stream, app.max_requests, token, |req, flags, resp| {
+    buran_worker::run(work, stream, app.max_requests, |req, flags, resp| {
         handle(req, flags, resp, app)
     })
 }
 
-/// Entry point for standalone `--channel` mode (no prototype, so no token).
+/// Entry point for standalone `--channel` mode (no prototype).
 pub fn run(work: &UnixDatagram, stream: UnixStream, app: AppConfig) -> Result<(), WorkerError> {
     boot(&app)?;
-    let result = serve(work, stream, &app, 0);
+    let result = serve(work, stream, &app);
     unsafe { ffi::bphp_sapi_shutdown() };
     result
 }

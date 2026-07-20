@@ -1,16 +1,127 @@
 # Buran Application Server — default configuration shipped by packages.
-# Serves static files from /var/www; add applications per your runtime
-# modules (`buran --modules` lists what is installed).
-# Reference: https://github.com/buran-project/buran
+#
+# Safe out of the box: it serves static files from /var/www and refuses the
+# usual sensitive files (dotfiles, VCS metadata). To run an application, install
+# a runtime module (`buran --modules` lists what is present) and uncomment the
+# `applications:` block plus the `fallback:` below.
+#
+# Validate after editing:  buran --check-config --config /etc/buran/buran.yaml
+# Every supported key is shown; keys left at their default are marked "# default"
+# (omitting them changes nothing). Full prose: docs/configuration.md,
+# docs/routing.md, docs/applications.md.
 
+# ─── settings — server-wide knobs; the whole block is optional. ──────────────
 settings:
-  modules: /usr/lib/buran/modules
+  # listen_threads: 4                # tokio worker threads; default: host CPU count
+  modules: /usr/lib/buran/modules    # runtime module dir (where packages install buran-<runtime>)
+  http:
+    header_read_timeout: 30          # default; wall-clock budget for the WHOLE header block (s)
+    body_read_timeout: 30            # default; max silence between body reads (s)
+    send_timeout: 30                 # default; time allowed to write the response (s)
+    idle_timeout: 180                # default; keep-alive idle between requests (s)
+    max_body_size: 8388608           # default 8 MiB; larger bodies get 413 (bytes)
+    min_body_rate: 256               # default; min sustained body throughput after grace (bytes/s); 0 disables (slow-POST/RUDY)
+    max_connections: 4096            # default; process-wide connection cap; counts WS tunnels; 0 disables
+    body_temp_path: /var/tmp/buran   # default; spill dir for bodies too large for memory (real disk, not tmpfs; the unit's PrivateTmp isolates it)
+    server_version: false            # hide the patch version: bare `buran` in the Server header (default: true)
+    static:
+      mime_types:                    # extra MIME -> [extensions], ADDED to the built-in table
+        text/x-buran: [".brn"]
+    websocket:
+      idle_timeout: 600              # default; two-way silence before a tunnel closes 1001 (s)
+      max_message_size: 1048576      # default 1 MiB; larger client messages close 1009 (bytes)
 
+# ─── access_log — combined format; omit to disable. Query + Referer/UA are
+#     logged verbatim (CR/LF-escaped), so keep secrets out of URLs. The package
+#     ships no /var/log/buran; create it (owned by root, or by the log writer)
+#     before enabling, or the server will not start. ────────────────────────
+# access_log: /var/log/buran/access.log
+
+# ─── error_log — diagnostic log (server + worker stdout/stderr). Omitted here so
+#     it goes to stderr -> journald (systemd-native). Level via RUST_LOG. Rotate
+#     with copytruncate (Buran holds the file open). Fatal startup errors always
+#     go to stderr regardless. ────────────────────────────────────────────────
+# error_log: /var/log/buran/error.log
+
+# ─── listeners — bind "host:port" -> a route XOR the status endpoint. `*` binds
+#     all interfaces; IPv6 as "[::1]:8080"; ports < 1024 need the root master. ─
 listeners:
   "*:8080":
     route: main
+  "127.0.0.1:9090":
+    status: true                     # GET /health -> ok; GET /health/applications -> pool metrics; else 404
+                                     # No in-config ACL: it exposes per-app names + live occupancy, so keep
+                                     # it on loopback (or a trusted interface) — never share a public bind.
 
+# ─── routes — ordered `match -> action` steps; first match wins. A step with no
+#     `match` matches everything (final fallthrough).
+#     Patterns: `*` wildcard, `!` negation, `~` regex prefix.
+#     Template vars: $uri $args ($query) $host $method $remote_addr ───────────
 routes:
   main:
+    # Refuse sensitive files before any `share` can serve them. Buran only
+    # auto-blocks executable sources (.php ...); dotfiles, VCS metadata, backups
+    # and dumps are deployment-specific and yours to deny. 404 (not 403) so a
+    # probe cannot confirm a file exists. Tune the list. See docs/static-files.md.
+    - match:
+        uri: "~/\\.(git|svn|hg|env|ht[a-z]*)(/|$)"
+      action:
+        return: 404
+    - match:
+        uri: ["*.bak", "*.sql", "*.log", "*.ini", "*~"]
+      action:
+        return: 404
+
+    # Optional: serve hashed assets straight from disk with their own rule
+    # (share, short form). Uncomment and adjust to taste.
+    # - match:
+    #     uri: ["/assets/*", "*.ico"]
+    #   action:
+    #     share: /var/www$uri
+
+    # Catch-all static serving from the document root (share, full form). A miss
+    # returns 404. To serve an application instead, install its module, uncomment
+    # the `applications:` block below, and add the `fallback:` shown here.
     - action:
-        share: /var/www$uri
+        share:
+          share: /var/www$uri          # path, or a list of candidate roots
+          index: index.html            # default; file served for a directory request
+          # types: ["text/*"]          # only serve these MIME types; others fall through
+          follow_symlinks: false       # default; true follows symlinks within the root
+          serve_sources: false         # default; true = all sources raw, or [".php"] = only those (least-privilege)
+        # fallback:                     # taken when `share` misses (40x) — routes everything else to the app
+        #   application: app
+
+# ─── applications — a runtime module bound to a document root + worker pool.
+#     Disabled by default (a bare/minimal install has no runtime module). Install
+#     one, then uncomment this block and the `fallback:` above. Only `module` is
+#     required. ─────────────────────────────────────────────────────────────
+# applications:
+#   app:
+#     module: php                      # binary suffix -> <modules>/buran-php (e.g. php85 for buran-php85)
+#     root: /var/www                   # document root
+#     index: index.php                 # directory index file
+#     # script: index.php              # single front-controller (alternative to root+index)
+#     user: buran                      # drop worker uid (the package's unprivileged account; needs the root master)
+#     group: buran                     # drop worker gid
+#     # working_directory: /var/www
+#     # execute: [".html"]             # extra executable extensions (also excluded from static serving)
+#     environment:                     # env for workers (passed via environ, not argv)
+#       APP_ENV: production
+#     processes: auto                  # one worker per CPU (default); or { max: 8, spare: 1, idle_timeout: 30 }, or a fixed N
+#     # concurrency: 64                # per-worker in-flight cap; PHP (blocking) is always 1
+#     queue:
+#       max: 24000                     # default; parked-request cap (memory guard); over -> 503
+#       timeout: 15                    # default; seconds a request may wait before an instant 503
+#     limits:
+#       response_timeout: 60           # default; wait for worker output -> 504 + Abort (worker NOT killed)
+#       task_timeout: 300              # default; total per-task incl. background -> Abort, kill if defiant
+#       requests: 0                    # default; recycle a worker after N requests (0 = never)
+#     options:                         # module-specific (PHP shown); validated by the module
+#       # ini_file: /etc/buran/php.ini # optional extra php.ini to load
+#       admin:                         # system ini, not overridable by ini_set() (like php_admin_value)
+#         opcache.enable: "1"
+#         opcache.memory_consumption: 192
+#         memory_limit: 256M
+#       user:                          # ini defaults scripts may override via ini_set()
+#         display_errors: "0"

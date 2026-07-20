@@ -56,18 +56,16 @@ pub fn serve(
     work: std::os::unix::net::UnixDatagram,
     stream: std::os::unix::net::UnixStream,
     app: &AppConfig,
-    token: u64,
 ) -> std::io::Result<()> {
     // The runtime is built here, strictly after the prototype's fork.
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(run(work, stream, app, token))
+    rt.block_on(run(work, stream, app))
 }
 
 async fn run(
     work: std::os::unix::net::UnixDatagram,
     stream: std::os::unix::net::UnixStream,
     app: &AppConfig,
-    token: u64,
 ) -> std::io::Result<()> {
     work.set_nonblocking(true)?;
     stream.set_nonblocking(true)?;
@@ -83,7 +81,6 @@ async fn run(
         pid: std::process::id(),
         concurrency: CONCURRENCY_UNBOUNDED,
         capabilities: CAP_BODY_STREAM | CAP_WEBSOCKET,
-        token,
     }
     .encode();
     let mut msg = Vec::with_capacity(FRAME_HEADER_LEN + hello.len());

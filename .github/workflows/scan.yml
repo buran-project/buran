@@ -1,9 +1,13 @@
-# Weekly vulnerability scan of the published images. Fails on HIGH/CRITICAL
-# findings with an available fix and publishes them to the Security tab, one
-# category per image.
+# Weekly vulnerability scan on two fronts:
+#   - Trivy over the published images: OS packages. Fails on HIGH/CRITICAL
+#     findings with an available fix and publishes them to the Security tab,
+#     one category per image.
+#   - cargo-audit over the Rust dependency tree: the RustSec advisory DB. This
+#     is the gap Trivy leaves — it scans the OS packages baked into an image,
+#     not the Rust crate graph the binaries are built from.
 #
-# Scope: the `supported` bake group only. Legacy cells (php 7.3-8.1) live on
-# EOL bases by design — built once, never rebuilt, findings permanent — so
+# Trivy scope: the `supported` bake group only. Legacy cells (php 7.3-8.1) live
+# on EOL bases by design — built once, never rebuilt, findings permanent — so
 # scanning them would just train everyone to ignore a red workflow. The image
 # list is read from `docker buildx bake --print`, docker-bake.hcl stays the
 # single source of truth.
@@ -71,3 +75,19 @@ jobs:
           sarif_file: trivy-results.sarif
           # one category per image, otherwise uploads overwrite each other
           category: trivy-${{ matrix.image }}
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit the Rust dependency tree
+        # Checks Cargo.lock against the RustSec advisory DB; non-zero on a
+        # vulnerable crate (yanked crates warn but do not fail). Covers what the
+        # image Trivy scan cannot see: the crate graph the binaries link.
+        run: cargo audit

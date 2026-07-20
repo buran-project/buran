@@ -216,6 +216,31 @@ fn validate_action(
         ));
     }
 
+    // Header-injection guard: a CR/LF in `location` or a `response_headers`
+    // entry would split the response into extra attacker-chosen headers. The
+    // config is trusted, but `${ENV}` substitution can splice a semi-trusted
+    // value in, so hold both to the same no-newline rule the PHP ini path
+    // already enforces at boot.
+    if let Some(loc) = &action.location {
+        reject_header_control(loc, &format!("{path}.location"), "\"location\"")?;
+    }
+    if let Some(headers) = &action.response_headers {
+        for (name, value) in headers {
+            reject_header_control(
+                name,
+                &format!("{path}.response_headers"),
+                &format!("header name \"{name}\""),
+            )?;
+            if let Some(v) = value {
+                reject_header_control(
+                    v,
+                    &format!("{path}.response_headers.{name}"),
+                    &format!("header \"{name}\" value"),
+                )?;
+            }
+        }
+    }
+
     // Multiple candidate paths (Unit-style fallback search) are not
     // implemented: the router silently uses only the first. Reject the array
     // rather than quietly ignore the rest.
@@ -255,6 +280,20 @@ fn validate_action(
         validate_action(fallback, &format!("{path}.fallback"), routes, applications)?;
     }
 
+    Ok(())
+}
+
+/// Reject the bytes that would break out of a single response-header line: CR
+/// and LF split the response (header injection) and NUL is never valid in a
+/// header. Applied to `location` and `response_headers` at load time so a
+/// `${ENV}`-spliced value cannot smuggle an extra header.
+fn reject_header_control(value: &str, path: &str, what: &str) -> Result<(), ConfigError> {
+    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(ConfigError::invalid(
+            path,
+            format!("{what} must not contain CR, LF, or NUL (header-injection guard)"),
+        ));
+    }
     Ok(())
 }
 

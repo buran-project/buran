@@ -33,8 +33,11 @@ pub struct AppState {
     pub access_log: Option<access_log::AccessLog>,
     /// settings.http.static.mime_types inverted: extension -> mime.
     pub mime_overrides: BTreeMap<String, String>,
-    /// Union of module source extensions (lowercase, no dot): never served
-    /// as static files unless a share opts in with `serve_sources: true`.
+    /// Extensions never served as static files unless a share opts in with
+    /// `serve_sources` (lowercase, no dot): the union of every module's declared
+    /// source extensions and every application's `execute` list. Global by
+    /// design — like the module extensions, an executable source is protected on
+    /// every share regardless of how a request reaches it (fallback or route).
     pub source_exts: std::collections::BTreeSet<String>,
 }
 
@@ -55,8 +58,18 @@ impl Router {
     pub fn new(
         validated: &Validated,
         mut spawners: BTreeMap<String, (Spawner, std::os::unix::net::UnixDatagram, Option<u32>)>,
-        source_exts: std::collections::BTreeSet<String>,
+        mut source_exts: std::collections::BTreeSet<String>,
     ) -> anyhow::Result<Self> {
+        // An application's `execute` extensions are executable source too (docs:
+        // "also excluded from static serving"), so fold them into the same
+        // global set the module's intrinsic extensions use. This protects every
+        // share regardless of how a request reaches it — direct fallback or a
+        // route jump — exactly like the module extensions already do.
+        for app in validated.applications.values() {
+            for ext in &app.execute {
+                source_exts.insert(ext.trim_start_matches('.').to_ascii_lowercase());
+            }
+        }
         let routes = routes::compile(validated)?;
 
         let body_temp = validated.config.settings.http.body_temp_path.clone();

@@ -54,14 +54,12 @@ install -Dm755 target/release/buran-php \
     %{buildroot}/usr/lib/buran/modules/buran-php%{php_suffix}
 install -Dm644 packaging/common/systemd/buran.service %{buildroot}%{_unitdir}/buran.service
 install -Dm644 packaging/common/systemd/buran.sysusers.conf %{buildroot}%{_sysusersdir}/buran.conf
-install -Dm644 packaging/common/systemd/buran.tmpfiles.conf %{buildroot}%{_tmpfilesdir}/buran.conf
 
 %pre
 %sysusers_create_compat packaging/common/systemd/buran.sysusers.conf
 
 %post
 %systemd_post buran.service
-%tmpfiles_create %{_tmpfilesdir}/buran.conf
 
 %preun
 %systemd_preun buran.service
@@ -78,7 +76,6 @@ install -Dm644 packaging/common/systemd/buran.tmpfiles.conf %{buildroot}%{_tmpfi
 %dir /usr/lib/buran/modules
 %{_unitdir}/buran.service
 %{_sysusersdir}/buran.conf
-%{_tmpfilesdir}/buran.conf
 
 %files php
 /usr/lib/buran/modules/buran-php%{php_suffix}

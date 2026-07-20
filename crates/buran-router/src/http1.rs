@@ -255,7 +255,7 @@ pub async fn serve_connection(
         // become real control bytes here. Reject them before the decoded path
         // can reach a response header (the directory-redirect `Location`) or a
         // worker's $_SERVER — a response-splitting / header-injection sink.
-        if path.iter().any(|&b| b < 0x20 || b == 0x7f) {
+        if has_control_byte(&path) {
             write_simple(&mut wr, 400, "Bad Request", false).await?;
             return Ok(());
         }
@@ -272,6 +272,16 @@ pub async fn serve_connection(
             .find(|(n, _)| n == b"host")
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
+        // The :258 guard only covered the decoded path. The query (verbatim,
+        // percent-encoded) and the Host header also flow into $_SERVER and the
+        // worker-built redirect `Location`, so hold them to the same invariant
+        // in Buran's own code rather than trusting httparse to have rejected any
+        // raw CR/LF. (`%0d%0a` stays inert as encoded text; a *raw* control byte
+        // is what we refuse here.)
+        if has_control_byte(&query) || has_control_byte(&host) {
+            write_simple(&mut wr, 400, "Bad Request", false).await?;
+            return Ok(());
+        }
         let meta = RequestMeta {
             method: &parsed.method,
             host: &host,
@@ -357,6 +367,16 @@ pub async fn serve_connection(
                     Some((p, q)) => (p, q),
                     None => (path.clone(), query.clone()),
                 };
+                // A rewrite runs its result through percent-decode + normalize,
+                // so a value that was inert as encoded text (e.g. `%0d%0a` from
+                // `$args`/`$host`) can surface as a real control byte in the
+                // rewritten path. The :258 guard saw only the pre-rewrite path,
+                // so re-check the effective path/query before they reach the
+                // redirect `Location` / `$_SERVER`.
+                if has_control_byte(&eff_path) || has_control_byte(&eff_query) {
+                    write_simple(&mut wr, 400, "Bad Request", false).await?;
+                    return Ok(());
+                }
                 let extra = &outcome.response_headers;
 
                 match outcome.decision {
@@ -370,14 +390,12 @@ pub async fn serve_connection(
                         types,
                         follow_symlinks,
                         serve_sources,
-                        extra_source_exts,
                         fallback,
                     } => {
                         let static_ctx = serve_static::StaticContext {
                             types,
                             mime_overrides: &state.mime_overrides,
                             source_exts: &state.source_exts,
-                            extra_source_exts,
                             follow_symlinks,
                             serve_sources,
                             req_headers: &parsed.headers,
@@ -1267,6 +1285,15 @@ fn split_target(target: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// True if any byte is a C0/DEL control byte. The load-bearing case is CR/LF:
+/// a value carrying one that reaches a response header (a `Location`) or a
+/// worker's `$_SERVER` is a response-splitting / header-injection primitive.
+/// Buran enforces "no control byte reaches such a sink" itself rather than
+/// relying on `httparse` rejecting raw CR/LF in the request line and headers.
+fn has_control_byte(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b < 0x20 || b == 0x7f)
+}
+
 pub async fn write_return<W: AsyncWriteExt + Unpin>(
     wr: &mut W,
     status: u16,
@@ -1441,6 +1468,25 @@ mod tests {
     fn parse_accepts_single_host_http11() {
         let raw = b"GET / HTTP/1.1\r\nHost: only.one\r\n\r\n";
         assert!(parse_request(raw).unwrap().bad.is_none());
+    }
+
+    #[test]
+    fn has_control_byte_flags_framing_bytes_only() {
+        // The invariant enforced on path/query/Host/eff_path before any of them
+        // reaches a `Location` header or `$_SERVER` (response-splitting guard).
+        assert!(has_control_byte(b"foo\r\nSet-Cookie: x")); // CRLF: the real target
+        assert!(has_control_byte(b"a\rb"));
+        assert!(has_control_byte(b"a\nb"));
+        assert!(has_control_byte(b"a\0b")); // NUL
+        assert!(has_control_byte(b"a\tb")); // HT is still C0
+        assert!(has_control_byte(&[0x1b])); // ESC
+        assert!(has_control_byte(&[0x7f])); // DEL
+        // Clean values pass — including high bytes (UTF-8 / IDN hostnames), which
+        // are not framing characters and must not be rejected.
+        assert!(!has_control_byte(b"/some/path?x=1&y=2"));
+        assert!(!has_control_byte(b"evil.example.com:8080"));
+        assert!(!has_control_byte(&[0xc3, 0xa9])); // 'é' in UTF-8
+        assert!(!has_control_byte(b""));
     }
 
     #[test]

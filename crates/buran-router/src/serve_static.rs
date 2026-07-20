@@ -26,11 +26,10 @@ const COPY_CHUNK: usize = 64 * 1024;
 pub struct StaticContext<'a> {
     pub types: Option<&'a PatternSet>,
     pub mime_overrides: &'a BTreeMap<String, String>,
-    /// Module source extensions: refused unless `serve_sources` opts in
-    /// (all, or the specific extension).
+    /// Source extensions never served as static unless `serve_sources` opts in
+    /// (all, or the specific extension). Union of every module's declared
+    /// extensions and every application's `execute` list, built once at startup.
     pub source_exts: &'a std::collections::BTreeSet<String>,
-    /// Per-share extras (fallback application's `execute` list).
-    pub extra_source_exts: &'a [String],
     /// Follow symlinks during resolution; when false, openat2 refuses any
     /// path component that is a symlink.
     pub follow_symlinks: bool,
@@ -84,8 +83,7 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let is_source =
-        ctx.source_exts.contains(&ext) || ctx.extra_source_exts.iter().any(|e| e == &ext);
+    let is_source = ctx.source_exts.contains(&ext);
     if is_source {
         let opted_in = match ctx.serve_sources {
             ServeSources::None => false,
@@ -420,7 +418,6 @@ mod tests {
             types: None,
             mime_overrides,
             source_exts,
-            extra_source_exts: &[],
             follow_symlinks: true,
             serve_sources,
             req_headers,
@@ -547,6 +544,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s4, None, "a list not containing php keeps .php protected");
+    }
+
+    #[tokio::test]
+    async fn folded_execute_extension_is_protected_like_a_module_source() {
+        // V1: an application's `execute` extension (e.g. ".inc") is folded into
+        // the global source_exts at startup (see Router::new), so it is refused
+        // as static exactly like a module source — on every share, regardless of
+        // how a request reaches it. The serve layer treats every source_exts
+        // member uniformly; this pins that a non-module extension is no different.
+        let dir = TempDir::new();
+        dir.write("config.inc", b"<?php $db_pass = 'secret';");
+        let mut src = BTreeSet::new();
+        src.insert("inc".to_string()); // as Router::new folds app.execute in
+        let mime = BTreeMap::new();
+
+        let mut out = Vec::new();
+        let status = serve(
+            &mut out,
+            &dir.template(),
+            "index.html",
+            b"/config.inc",
+            &ctx(&mime, &src, &[], &ServeSources::None, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, None, "a folded execute ext must not be served as static");
+
+        // The per-share opt-out still applies to it.
+        let mut out2 = Vec::new();
+        let s2 = serve(
+            &mut out2,
+            &dir.template(),
+            "index.html",
+            b"/config.inc",
+            &ctx(&mime, &src, &[], &ServeSources::All, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s2, Some(200));
     }
 
     #[tokio::test]

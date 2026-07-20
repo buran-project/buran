@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use buran_config::{
-    Action as ConfAction, Application, ApplicationRef, Match, OneOrMany, ServeSources, Share,
-    Validated,
+    Action as ConfAction, ApplicationRef, Match, OneOrMany, ServeSources, Share, Validated,
 };
 
 use crate::matching::{CidrSet, PatternSet};
@@ -45,9 +44,6 @@ pub enum Action {
         follow_symlinks: bool,
         /// Opt-out of module source-leak protection (none / all / a list).
         serve_sources: ServeSources,
-        /// Per-app `execute` extensions of the fallback application
-        /// (lowercase, no dot): forbidden for this share specifically.
-        extra_source_exts: Vec<String>,
         fallback: Option<Box<Action>>,
     },
     Return { status: u16, location: Option<String> },
@@ -62,7 +58,6 @@ pub enum Decision<'r> {
         types: Option<&'r PatternSet>,
         follow_symlinks: bool,
         serve_sources: &'r ServeSources,
-        extra_source_exts: &'r [String],
         fallback: Option<&'r Action>,
     },
     Return { status: u16, location: Option<&'r str> },
@@ -111,7 +106,7 @@ pub fn compile(validated: &Validated) -> anyhow::Result<CompiledRoutes> {
                     .map(Template::compile)
                     .transpose()?,
                 response_headers,
-                action: compile_action(&step.action, &validated.applications)?,
+                action: compile_action(&step.action)?,
             });
         }
         routes.insert(name.clone(), compiled);
@@ -155,10 +150,7 @@ fn compile_match(m: &Match) -> anyhow::Result<Matcher> {
     })
 }
 
-fn compile_action(
-    action: &ConfAction,
-    apps: &BTreeMap<String, Application>,
-) -> anyhow::Result<Action> {
+fn compile_action(action: &ConfAction) -> anyhow::Result<Action> {
     if let Some(app) = &action.application {
         let ApplicationRef::Name(name) = app else {
             unreachable!("inline apps are extracted during validation");
@@ -187,29 +179,17 @@ fn compile_action(
         let fallback = action
             .fallback
             .as_ref()
-            .map(|f| compile_action(f, apps).map(Box::new))
+            .map(|f| compile_action(f).map(Box::new))
             .transpose()?;
-        // The fallback application shares this file tree: its `execute`
-        // extensions must not be served as static from here.
-        let extra_source_exts = match fallback.as_deref() {
-            Some(Action::Application { name }) => apps
-                .get(name)
-                .map(|a| {
-                    a.execute
-                        .iter()
-                        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+        // Note: an application's `execute` extensions are source-leak-protected
+        // globally (folded into `AppState.source_exts` at startup, like the
+        // module's own extensions), so a share needs no per-fallback list here.
         return Ok(Action::Share {
             template,
             index,
             types,
             follow_symlinks,
             serve_sources,
-            extra_source_exts,
             fallback,
         });
     }
@@ -274,7 +254,6 @@ impl CompiledRoutes {
                     types,
                     follow_symlinks,
                     serve_sources,
-                    extra_source_exts,
                     fallback,
                 } => Decision::Share {
                     template,
@@ -282,7 +261,6 @@ impl CompiledRoutes {
                     types: types.as_ref(),
                     follow_symlinks: *follow_symlinks,
                     serve_sources,
-                    extra_source_exts,
                     fallback: fallback.as_deref(),
                 },
                 Action::Return { status, location } => {

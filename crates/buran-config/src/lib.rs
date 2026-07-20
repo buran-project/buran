@@ -41,6 +41,12 @@ pub fn from_str(yaml: &str) -> Result<Validated, ConfigError> {
     reject_anchors(yaml)?;
 
     let mut value: serde_norway::Value = serde_norway::from_str(yaml)?;
+    // `${ENV}` is expanded before the typed deserialization below, so the tree
+    // handed to `from_value` already holds resolved values. A `ConfigError::Yaml`
+    // from a type/enum mismatch can therefore include a substituted secret in its
+    // message; callers that log it (see `buran::main`) must treat that output as
+    // secret-bearing. Documented in docs/configuration.md. `EnvMissing` here is
+    // safe — it carries only the variable name and path, never the value.
     subst::substitute_env(&mut value, "$")?;
 
     let config: Config = serde_norway::from_value(value)?;
@@ -263,6 +269,65 @@ applications:
             ConfigError::Invalid { path, .. } => assert!(path.ends_with(".share"), "path: {path}"),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn location_with_crlf_is_rejected() {
+        // `${ENV}` could splice a newline into a redirect target; a CR/LF there
+        // would split the response into attacker-chosen headers. Reject at load.
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action: { return: 301, location: \"/next\\r\\nSet-Cookie: evil=1\" }
+";
+        match err(yaml) {
+            ConfigError::Invalid { path, .. } => {
+                assert!(path.ends_with(".location"), "path: {path}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_header_value_with_crlf_is_rejected() {
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - action:
+        application: app
+        response_headers: { X-Env: \"ok\\r\\nSet-Cookie: evil=1\" }
+applications:
+  app: { module: test }
+";
+        match err(yaml) {
+            ConfigError::Invalid { path, .. } => {
+                assert!(path.contains("response_headers"), "path: {path}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_location_and_headers_are_accepted() {
+        // Guard against over-rejection: ordinary values must still pass.
+        let yaml = "\
+listeners:
+  \"*:8080\": { route: main }
+routes:
+  main:
+    - match: { uri: \"/old\" }
+      action: { return: 301, location: /home }
+    - action:
+        application: app
+        response_headers: { X-Frame-Options: DENY, X-Powered-By: null }
+applications:
+  app: { module: test }
+";
+        assert!(from_str(yaml).is_ok());
     }
 
     #[test]

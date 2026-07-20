@@ -48,8 +48,11 @@ use buran_ipc::{
 /// worker's parent (the prototype) so it is pid-reuse safe — the router never
 /// signals a pid directly.
 pub trait Spawn: Send + Sync {
-    /// Spawn one worker and return the router side of its response stream.
-    fn spawn(&self) -> anyhow::Result<tokio::net::UnixStream>;
+    /// Spawn one worker; return the router side of its response stream and the
+    /// authoritative kill token the supervisor assigned it. The token comes
+    /// from the spawner, never from the worker's Hello, so a worker cannot
+    /// choose (or spoof) its own kill identity and misdirect a kill at a sibling.
+    fn spawn(&self) -> anyhow::Result<(tokio::net::UnixStream, u64)>;
     /// Ask the prototype to SIGKILL the worker with this token. Best-effort.
     fn kill(&self, token: u64);
 }
@@ -113,8 +116,9 @@ struct Pending {
 struct WorkerState {
     name: String,
     pid: u32,
-    /// Stable identity from Hello: the router asks the prototype to kill by
-    /// this token (pid-reuse safe), never by `pid`.
+    /// Authoritative kill token assigned by the supervisor (delivered with the
+    /// spawn, not self-reported by the worker): the router asks the prototype
+    /// to kill by this token (pid-reuse safe), never by `pid`.
     token: u64,
     /// Effective concurrency granted in HelloAck (u32::MAX = unbounded).
     granted: u32,
@@ -137,6 +141,13 @@ impl WorkerState {
 }
 
 struct Metrics {
+    /// Provisioned worker slots: incremented when a slot starts spawning and
+    /// decremented when it is retired, so it counts slots still spawning,
+    /// handshaking, or backing off after a crash — not just serving ones. Used
+    /// for provisioning decisions (the floor/refill and the growth cap). The
+    /// *live serving* set is `Pool::workers`; occupancy reported to operators
+    /// uses that (see `Pool::live_workers`) so a pool whose workers cannot come
+    /// up does not look healthy.
     active: AtomicU32,
     in_flight: AtomicU32,
 }
@@ -171,6 +182,10 @@ pub struct Pool {
     idle_exit: Option<Duration>,
     metrics: Metrics,
     worker_seq: AtomicU32,
+    /// Consecutive fast worker crashes (came up, then died within
+    /// `HEALTHY_UPTIME`). Drives exponential respawn backoff; reset to 0 the
+    /// moment a worker survives long enough to count as healthy.
+    crash_streak: AtomicU32,
     body_temp_path: std::path::PathBuf,
     /// uid the workers drop to, if any: spilled request bodies are created
     /// 0600 and chowned to it so a worker under a different user can open
@@ -196,6 +211,30 @@ pub struct Pool {
 /// Payload larger than this spills to a temp file (datagram size budget)
 /// or, for CAP_BODY_STREAM pools, flows as RequestBody frames.
 pub const INLINE_BODY_LIMIT: usize = 96 * 1024;
+
+/// A worker that exits within this window of coming up is treated as a crash
+/// (bad module, poisoned opcache, fatal on the first request) rather than a
+/// healthy recycle/retire, and triggers respawn backoff.
+const HEALTHY_UPTIME: Duration = Duration::from_secs(10);
+/// Base respawn delay after a crash, doubled per consecutive fast crash.
+const CRASH_BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Ceiling on the respawn backoff: a persistently broken pool retries at this
+/// bounded slow rate instead of storming forks (and, as PID 1, SIGCHLD).
+const CRASH_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Budget for a freshly-spawned worker to send its Hello. Warm workers (forked
+/// from an already-booted prototype) answer in milliseconds; this only bounds a
+/// wedged/hung module that connected but never handshakes. Such a slot is not
+/// yet in `workers`, so the task_timeout sweep does not cover it — without this
+/// the pre-Hello read would park forever, slowly bleeding pool capacity.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Exponential backoff for a crash streak: `BASE * 2^(streak-1)`, capped at
+/// `CRASH_BACKOFF_MAX`. The shift is clamped so the multiply cannot overflow.
+fn crash_backoff(streak: u32) -> Duration {
+    let shift = streak.saturating_sub(1).min(9);
+    CRASH_BACKOFF_BASE.saturating_mul(1u32 << shift).min(CRASH_BACKOFF_MAX)
+}
 
 impl Pool {
     pub fn start(
@@ -243,6 +282,7 @@ impl Pool {
             idle_exit,
             metrics: Metrics { active: AtomicU32::new(0), in_flight: AtomicU32::new(0) },
             worker_seq: AtomicU32::new(0),
+            crash_streak: AtomicU32::new(0),
             body_temp_path: std::path::PathBuf::from(body_temp_path),
             body_owner,
             concurrency_cap: app.concurrency.unwrap_or(u32::MAX),
@@ -326,7 +366,11 @@ impl Pool {
 
     /// Snapshot of pool occupancy for /status.
     pub fn stats(&self) -> PoolStats {
-        let workers = self.metrics.active.load(Ordering::Relaxed);
+        // Report the live serving set, not provisioned slots (`metrics.active`):
+        // a slot still spawning / handshaking / backing off must not show up as
+        // an available worker, or a pool that cannot bring workers up would look
+        // healthy while nothing can answer.
+        let workers = self.live_workers();
         // One pass over pending: an entry is claimed once a worker picked it
         // up (`claimed_by`), otherwise it is still waiting in the kernel queue.
         let claimed = {
@@ -335,11 +379,11 @@ impl Pool {
         };
         let in_flight = self.metrics.in_flight.load(Ordering::Relaxed) as usize;
         let queued = in_flight.saturating_sub(claimed);
-        // Free request slots: total capacity minus what workers hold now. For
+        // Free request slots: live capacity minus what workers hold now. For
         // blocking pools (concurrency 1) this is exactly the idle worker count.
-        let capacity = u64::from(workers) * self.worker_concurrency();
+        let capacity = workers * self.worker_concurrency();
         let idle = capacity.saturating_sub(claimed as u64);
-        PoolStats { workers, idle, queued }
+        PoolStats { workers: workers as u32, idle, queued }
     }
 
     /// Concurrency of one worker for capacity math: before the first
@@ -354,6 +398,15 @@ impl Pool {
     /// Total requests the current workers can hold at once.
     fn capacity(&self) -> u64 {
         u64::from(self.metrics.active.load(Ordering::Relaxed)) * self.worker_concurrency()
+    }
+
+    /// Workers that have completed their handshake and can serve — the
+    /// authoritative live set. Unlike `metrics.active` (provisioned slots,
+    /// which include ones still spawning / handshaking / backing off), this
+    /// reflects what is actually serving, so operator-facing occupancy cannot
+    /// report a healthy pool while nothing can answer.
+    fn live_workers(&self) -> u64 {
+        self.workers.lock().expect("workers lock").len() as u64
     }
 
     /// Reserve a queue slot up front, before the caller does any expensive
@@ -592,8 +645,8 @@ impl Pool {
 
         tokio::spawn(async move {
             loop {
-                let stream = match pool.spawner.spawn() {
-                    Ok(s) => s,
+                let (stream, token) = match pool.spawner.spawn() {
+                    Ok(spawned) => spawned,
                     Err(e) => {
                         error!(worker = %name, "spawn failed: {e:#}; retrying in 1s");
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -602,17 +655,38 @@ impl Pool {
                 };
                 let (rd, wr) = stream.into_split();
                 let mut reader = BufReader::with_capacity(64 * 1024, rd);
-                match handshake(&pool, &name, &mut reader, wr).await {
+                match handshake(&pool, &name, &mut reader, wr, token).await {
                     Ok(worker) => {
                         info!(
                             worker = %name, pid = worker.pid,
                             concurrency = worker.granted, "worker ready"
                         );
+                        let up = Instant::now();
                         pool.workers.lock().expect("workers lock").insert(id, Arc::clone(&worker));
                         reader_task(&pool, id, &worker, reader).await;
                         pool.workers.lock().expect("workers lock").remove(&id);
-                        // Worker gone (recycle, crash, retire): the reader
-                        // accounted for in-flight fallout; restore the floor.
+
+                        // A worker that dies almost immediately after coming up
+                        // is crash-looping, not recycling. Without a brake this
+                        // is an unthrottled fork/boot storm (and, as PID 1, a
+                        // SIGCHLD flood) that one bad app can use to starve the
+                        // whole box. Back off exponentially per consecutive fast
+                        // crash; respawn this slot in place so the streak (and
+                        // its `active` count) persists across attempts.
+                        if up.elapsed() < HEALTHY_UPTIME {
+                            let streak = pool.crash_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                            let backoff = crash_backoff(streak);
+                            error!(
+                                worker = %name, streak, uptime = ?up.elapsed(),
+                                "worker crashed on startup; backing off {backoff:?} before respawn"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                        // Healthy lifetime (normal recycle/retire/kill): clear
+                        // the streak and let the floor logic decide on a
+                        // replacement. The reader accounted for in-flight fallout.
+                        pool.crash_streak.store(0, Ordering::Relaxed);
                         pool.retire_and_refill();
                         return;
                     }
@@ -634,8 +708,22 @@ async fn handshake(
     name: &str,
     reader: &mut BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
+    token: u64,
 ) -> std::io::Result<Arc<WorkerState>> {
-    let (header, payload) = read_frame(reader).await?;
+    // Bound the pre-Hello read: a worker that connects but never handshakes must
+    // not park this slot's spawn task forever (it is not yet in `workers`, so the
+    // sweep cannot reap it). On elapse, reap it by its authoritative token and
+    // surface an error so spawn_worker respawns.
+    let (header, payload) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(reader)).await {
+        Ok(frame) => frame?,
+        Err(_) => {
+            pool.spawner.kill(token);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker did not send Hello within the handshake timeout",
+            ));
+        }
+    };
     if header.kind != FrameKind::Hello {
         return Err(std::io::Error::other("expected Hello"));
     }
@@ -684,7 +772,7 @@ async fn handshake(
     let worker = Arc::new(WorkerState {
         name: name.to_string(),
         pid: hello.pid,
-        token: hello.token,
+        token,
         granted,
         writer: tokio::sync::Mutex::new(writer),
         kill_requested: std::sync::atomic::AtomicBool::new(false),
@@ -709,17 +797,8 @@ async fn reader_task(
     loop {
         let (header, payload) = match read_frame(&mut stream).await {
             Ok(f) => f,
-            Err(_) => {
-                // Worker exited. Every claimed-but-unfinished request fails;
-                // unconsumed datagrams stay queued for survivors.
-                for id in claimed.drain() {
-                    if let Some(p) = pool.pending.lock().expect("pending lock").remove(&id) {
-                        pool.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
-                        let _ = p.events.try_send(WorkerEvent::Failed(DispatchError::WorkerFailed));
-                    }
-                }
-                return;
-            }
+            // Worker exited: run the shared cleanup after the loop.
+            Err(_) => break,
         };
 
         let id = header.request_id;
@@ -741,6 +820,25 @@ async fn reader_task(
 
         let event = match header.kind {
             FrameKind::Claim => {
+                // Granted-concurrency contract enforcement. A worker at its
+                // grant must stop reading the shared work socket; one that
+                // claims beyond `granted` is draining the kernel queue past its
+                // share — starving sibling workers and breaking the capacity
+                // math (idle/queued on /status are derived from the live worker
+                // count * granted, so an over-claiming worker would make them lie).
+                // Nothing in the frame stops a buggy/hostile worker from doing
+                // this, so the router enforces the bound here: a violation is a
+                // protocol breach — kill the worker and let the pool refill.
+                if claimed.len() >= worker.granted as usize {
+                    error!(
+                        worker = %worker.name, pid = worker.pid, granted = worker.granted,
+                        "worker claimed beyond its granted concurrency; killing"
+                    );
+                    if !worker.kill_requested.swap(true, Ordering::Relaxed) {
+                        pool.spawner.kill(worker.token);
+                    }
+                    break;
+                }
                 let body = {
                     let mut pending = pool.pending.lock().expect("pending lock");
                     match pending.get_mut(&id) {
@@ -833,6 +931,16 @@ async fn reader_task(
         if let Some(sender) = sender {
             // Client gone (dropped receiver): frames are simply discarded.
             let _ = sender.send(event).await;
+        }
+    }
+
+    // Reader exiting (worker EOF, or killed above for exceeding its grant):
+    // every request it claimed but never finished fails; datagrams it never
+    // consumed stay queued for the survivors.
+    for id in claimed.drain() {
+        if let Some(p) = pool.pending.lock().expect("pending lock").remove(&id) {
+            pool.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+            let _ = p.events.try_send(WorkerEvent::Failed(DispatchError::WorkerFailed));
         }
     }
 }
@@ -1062,17 +1170,21 @@ applications:
     struct TestSpawner {
         tx: tokio::sync::mpsc::UnboundedSender<UnixStream>,
         killed: Mutex<Vec<u64>>,
+        next_token: std::sync::atomic::AtomicU64,
     }
 
     impl Spawn for TestSpawner {
-        fn spawn(&self) -> anyhow::Result<tokio::net::UnixStream> {
+        fn spawn(&self) -> anyhow::Result<(tokio::net::UnixStream, u64)> {
             let (router_side, worker_side) = std::os::unix::net::UnixStream::pair()?;
             router_side.set_nonblocking(true)?;
             worker_side.set_nonblocking(true)?;
             self.tx
                 .send(UnixStream::from_std(worker_side)?)
                 .map_err(|_| anyhow::anyhow!("test dropped the stream receiver"))?;
-            Ok(UnixStream::from_std(router_side)?)
+            // The token is the supervisor's to assign — mirror that here so the
+            // kill path is exercised with an authoritative, worker-independent id.
+            let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+            Ok((UnixStream::from_std(router_side)?, token))
         }
         fn kill(&self, token: u64) {
             self.killed.lock().expect("killed lock").push(token);
@@ -1081,7 +1193,14 @@ applications:
 
     fn test_spawner() -> (Arc<TestSpawner>, tokio::sync::mpsc::UnboundedReceiver<UnixStream>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Arc::new(TestSpawner { tx, killed: Mutex::new(Vec::new()) }), rx)
+        (
+            Arc::new(TestSpawner {
+                tx,
+                killed: Mutex::new(Vec::new()),
+                next_token: std::sync::atomic::AtomicU64::new(1),
+            }),
+            rx,
+        )
     }
 
     async fn wk_send(stream: &mut UnixStream, kind: FrameKind, id: u32, aux: u32, payload: &[u8]) {
@@ -1139,7 +1258,6 @@ applications:
             pid: 0, // kill_worker ignores pid 0: no stray signals from tests
             concurrency: declare,
             capabilities,
-            token: 0,
         }
         .encode();
         wk_send(&mut stream, FrameKind::Hello, 0, 0, &hello).await;
@@ -1280,6 +1398,179 @@ applications:
     }
 
     #[tokio::test]
+    async fn over_claiming_worker_is_killed_and_its_requests_fail() {
+        // H1: a blocking worker (granted 1) must not claim a second request
+        // while it still holds one — that drains the shared kernel queue past
+        // its grant and starves siblings. The router enforces the grant: the
+        // second claim is a protocol violation, so the worker is killed and
+        // every request it had claimed fails.
+        let mut r = rig(Some(1), 1, 0).await;
+
+        let mut first = r
+            .pool
+            .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+            .await
+            .unwrap();
+        let _second = r
+            .pool
+            .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+            .await
+            .unwrap();
+        let id1 = wk_recv_work(&r.work).await.request_id;
+        let id2 = wk_recv_work(&r.work).await.request_id;
+
+        // First claim sits at the grant (allowed); the second exceeds it.
+        wk_send(&mut r.stream, FrameKind::Claim, id1, 0, &[]).await;
+        wk_send(&mut r.stream, FrameKind::Claim, id2, 0, &[]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            r.spawner.killed.lock().unwrap().len(),
+            1,
+            "the over-claiming worker must be killed"
+        );
+        // The request it legitimately held fails as the reader tears down.
+        assert!(
+            matches!(
+                timeout(TICK, first.next_event()).await.unwrap(),
+                Some(WorkerEvent::Failed(DispatchError::WorkerFailed))
+            ),
+            "the killed worker's claimed request must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_may_claim_up_to_its_grant_then_no_further() {
+        // H1 boundary: an event-loop worker granted 2 may hold two requests at
+        // once (legitimate, no kill), but a third concurrent claim exceeds the
+        // grant and is a violation.
+        let mut r = rig(Some(2), 2, 0).await;
+
+        let mut streams = Vec::new();
+        for _ in 0..3 {
+            streams.push(
+                r.pool
+                    .submit(r.pool.try_reserve().unwrap(), request_payload(), SubmitBody::Inline)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let id1 = wk_recv_work(&r.work).await.request_id;
+        let id2 = wk_recv_work(&r.work).await.request_id;
+        let id3 = wk_recv_work(&r.work).await.request_id;
+
+        // Two concurrent claims sit exactly at the grant: allowed.
+        wk_send(&mut r.stream, FrameKind::Claim, id1, 0, &[]).await;
+        wk_send(&mut r.stream, FrameKind::Claim, id2, 0, &[]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            r.spawner.killed.lock().unwrap().is_empty(),
+            "claiming up to the grant is legitimate — no kill"
+        );
+
+        // The third concurrent claim exceeds the grant: violation -> kill.
+        wk_send(&mut r.stream, FrameKind::Claim, id3, 0, &[]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            r.spawner.killed.lock().unwrap().len(),
+            1,
+            "claiming beyond the grant kills the worker"
+        );
+        // Both properly-held requests fail on teardown.
+        for rs in &mut streams[..2] {
+            assert!(matches!(
+                timeout(TICK, rs.next_event()).await.unwrap(),
+                Some(WorkerEvent::Failed(DispatchError::WorkerFailed))
+            ));
+        }
+    }
+
+    #[test]
+    fn crash_backoff_grows_then_caps() {
+        // H2: exponential per-crash, capped so a broken pool never storms.
+        assert_eq!(crash_backoff(1), Duration::from_millis(100));
+        assert_eq!(crash_backoff(2), Duration::from_millis(200));
+        assert_eq!(crash_backoff(3), Duration::from_millis(400));
+        assert_eq!(crash_backoff(9), Duration::from_millis(25_600));
+        // Beyond the shift cap it saturates at the ceiling, never overflowing.
+        assert_eq!(crash_backoff(10), CRASH_BACKOFF_MAX);
+        assert_eq!(crash_backoff(u32::MAX), CRASH_BACKOFF_MAX);
+    }
+
+    #[tokio::test]
+    async fn fast_worker_crash_bumps_the_backoff_streak() {
+        // H2: a worker that comes up then dies almost immediately is a crash,
+        // not a recycle. The pool records it as a crash streak (which drives
+        // exponential respawn backoff) instead of refilling instantly.
+        let r = rig(Some(1), 1, 0).await;
+        assert_eq!(r.pool.crash_streak.load(Ordering::Relaxed), 0);
+
+        // The freshly-handshaked worker dies at once.
+        drop(r.stream);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert_eq!(
+            r.pool.crash_streak.load(Ordering::Relaxed),
+            1,
+            "a fast post-handshake crash must bump the streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_reports_live_workers_not_provisioned_slots() {
+        // M11: `metrics.active` counts a slot from the moment it starts spawning,
+        // but /health must report only workers that completed the handshake and
+        // can serve — otherwise a pool whose workers cannot come up looks healthy.
+        let r = rig(Some(1), 1, 0).await;
+        assert_eq!(r.pool.stats().workers, 1, "the handshaked worker is live");
+
+        // The worker dies; the slot respawns in place (crash backoff), but the
+        // replacement never handshakes (no Hello is fed), so it is provisioned
+        // (active stays 1) yet not live.
+        drop(r.stream);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert_eq!(
+            r.pool.stats().workers,
+            0,
+            "a provisioned-but-unhandshaked slot must not count as a live worker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_worker_is_reaped_after_handshake_timeout() {
+        // L7: a worker that connects but never sends Hello must not park its
+        // slot's spawn task forever (it is not in `workers`, so the sweep can't
+        // reap it). The pre-Hello read is bounded; on elapse it is killed by its
+        // token. Uses a paused clock so the budget elapses without real waiting.
+        let (spawner, mut spawns) = test_spawner();
+        let (router_work, worker_work) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        worker_work.set_nonblocking(true).unwrap();
+        let _work = UnixDatagram::from_std(worker_work).unwrap();
+        let temp = std::env::temp_dir().join("buran-dispatch-tests");
+        let _pool = Pool::start(
+            "app",
+            &test_app(Some(1)),
+            Arc::clone(&spawner) as Spawner,
+            router_work,
+            temp.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        // Take the worker end but never send Hello.
+        let _silent = timeout(TICK, spawns.recv()).await.unwrap().unwrap();
+
+        // Let the handshake budget elapse; the reader gives up and reaps it.
+        tokio::time::sleep(HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+
+        assert!(
+            !spawner.killed.lock().unwrap().is_empty(),
+            "a worker that never sends Hello must be reaped by its token"
+        );
+    }
+
+    #[tokio::test]
     async fn end_releases_client_but_done_frees_the_slot() {
         let mut r = rig(Some(1), 1, 0).await;
         let mut rs = r
@@ -1338,7 +1629,9 @@ applications:
         let (to_abort2, candidates2) = r.pool.sweep_decide(t2, Duration::from_millis(100));
         assert!(to_abort2.is_empty(), "already aborted once");
         assert_eq!(candidates2.len(), 1, "one defiant slot = 100% for a blocking worker");
-        assert_eq!(candidates2[0].token, 0);
+        // The kill targets the supervisor-assigned token (first spawn = 1), not
+        // anything the worker self-reported in Hello.
+        assert_eq!(candidates2[0].token, 1);
         assert_eq!(candidates2[0].probe_task, id);
     }
 

@@ -3,8 +3,9 @@
 //! strictly single-threaded until fork, the child builds its async runtime
 //! only after it.
 //!
-//! Control protocol (supervisor -> prototype), one command byte each:
-//! - `CMD_SPAWN`: fork a worker; the channel fd rides via SCM_RIGHTS.
+//! Control protocol (supervisor -> prototype):
+//! - `CMD_SPAWN`: an 8-byte supervisor-assigned token follows; fork a worker on
+//!   the channel fd (attached via SCM_RIGHTS) and map the token to its pid.
 //! - `CMD_KILL`:  followed by an 8-byte worker token; SIGKILL that worker.
 //!
 //! The prototype is the workers' parent, so killing by the pid it forked is
@@ -27,7 +28,9 @@ const CMD_KILL: u8 = 2;
 
 /// A control command from the supervisor.
 enum Command {
-    Spawn(OwnedFd),
+    /// Fork a worker on this channel fd, tagged with the supervisor-assigned
+    /// token (mapped to the child pid for reuse-safe kills).
+    Spawn(OwnedFd, u64),
     Kill(u64),
 }
 
@@ -103,9 +106,9 @@ pub fn run(control_fd: RawFd, work_fd: RawFd) -> ! {
             std::process::exit(1);
         }
 
-    // token -> child pid, for reuse-safe kills by the parent.
+    // token -> child pid, for reuse-safe kills by the parent. The token is
+    // assigned by the supervisor and delivered with CMD_SPAWN, not minted here.
     let mut workers: HashMap<u64, Pid> = HashMap::new();
-    let mut next_token: u64 = 1;
 
     loop {
         reap_children(&mut workers);
@@ -117,8 +120,8 @@ pub fn run(control_fd: RawFd, work_fd: RawFd) -> ! {
             continue;
         }
 
-        let worker_fd = match recv_command(&control) {
-            Ok(Some(Command::Spawn(fd))) => fd,
+        let (worker_fd, token) = match recv_command(&control) {
+            Ok(Some(Command::Spawn(fd, token))) => (fd, token),
             Ok(Some(Command::Kill(token))) => {
                 if let Some(&pid) = workers.get(&token) {
                     let _ = kill(pid, Signal::SIGKILL);
@@ -131,9 +134,6 @@ pub fn run(control_fd: RawFd, work_fd: RawFd) -> ! {
                 std::process::exit(1);
             }
         };
-
-        let token = next_token;
-        next_token += 1;
 
         // Safety: single-threaded by construction — the tokio runtime
         // exists only in children, never here.
@@ -148,7 +148,7 @@ pub fn run(control_fd: RawFd, work_fd: RawFd) -> ! {
                         std::process::exit(1);
                     }
                 };
-                let _ = worker::serve(work, stream, &app, token);
+                let _ = worker::serve(work, stream, &app);
                 std::process::exit(0);
             }
             Ok(ForkResult::Parent { child }) => {
@@ -214,9 +214,19 @@ fn recv_command(control: &UnixStream) -> std::io::Result<Option<Command>> {
     }
 
     match cmd[0] {
-        // Safety: freshly received fd, we are its sole owner.
         CMD_SPAWN => match spawn_fd {
-            Some(fd) => Ok(Some(Command::Spawn(unsafe { OwnedFd::from_raw_fd(fd) }))),
+            Some(fd) => {
+                // The fd rode as ancillary data on the command byte; the 8-byte
+                // token follows it on the stream. Read it byte-exact.
+                let mut token = [0u8; 8];
+                let mut reader: &UnixStream = control;
+                reader.read_exact(&mut token)?;
+                // Safety: freshly received fd, we are its sole owner.
+                Ok(Some(Command::Spawn(
+                    unsafe { OwnedFd::from_raw_fd(fd) },
+                    u64::from_le_bytes(token),
+                )))
+            }
             None => Err(std::io::Error::other("spawn command without an fd")),
         },
         CMD_KILL => {

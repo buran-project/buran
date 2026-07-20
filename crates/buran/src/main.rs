@@ -29,6 +29,10 @@ fn main() -> ExitCode {
     // Logging is initialised inside `run()`, after the config is read, so its
     // destination can honour `error_log`. A failure here therefore predates the
     // logger — print straight to stderr so it is never swallowed.
+    //
+    // Note: a config-load error can carry a substituted `${ENV}` value (env is
+    // expanded before typed deserialization), so this output — and `error_log`
+    // once it is up — may be secret-bearing. See docs/configuration.md.
     match run() {
         Ok(code) => code,
         Err(e) => {

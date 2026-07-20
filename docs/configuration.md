@@ -247,6 +247,10 @@ error_log: /var/log/buran/error.log      # omit -> stderr
   crash-forensics keep the default stderr and let the platform capture it.
 - If a PHP app sets its own `error_log` ini to a file, PHP writes there
   directly, bypassing this setting.
+- **The log may contain config values.** A failed config load can echo a
+  substituted `${ENV}` value in its error message (see [Environment variable
+  substitution](#environment-variable-substitution)), so treat `error_log` and
+  stderr as potentially secret-bearing when the server fails to start.
 
 ## Environment variable substitution
 
@@ -266,8 +270,19 @@ Rules:
 - Only the full `${NAME}` form is a token. Bare `$NAME` is passed through
   literally.
 - A missing variable is a hard error at load time, reporting the config path
-  where it occurred (fail fast, no silent empty strings).
+  where it occurred (fail fast, no silent empty strings) — the error carries the
+  variable **name and location only**, never its value.
 - An unterminated `${` (no closing `}`) is kept literally.
+
+> **Security — a substituted value can surface in a startup error.**
+> Substitution happens before the config is deserialized into its typed form, so
+> if a config that fails to load carries a `${SECRET}` in a field that then fails
+> the schema/type check, that value may appear verbatim in the failure message —
+> on stderr and, once the logger is up, in [`error_log`](#error_log). Treat those
+> logs as potentially secret-bearing. To keep the exposure minimal, put secrets
+> only in fields that hold them as plain strings (`environment:` values, module
+> `options` ini) — not in typed fields like ports or process counts, where a
+> wrong value is echoed back inside the type error.
 
 This is how one image can serve every cell of a build matrix — see
 `tests/smoke/php.yaml`, which selects the module via `${BURAN_SMOKE_MODULE}`.
