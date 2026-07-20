@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use buran_config::{Action as ConfAction, Application, ApplicationRef, Match, OneOrMany, Share, Validated};
+use buran_config::{
+    Action as ConfAction, ApplicationRef, Match, OneOrMany, ServeSources, Share, Validated,
+};
 
 use crate::matching::{CidrSet, PatternSet};
 use crate::template::Template;
@@ -40,11 +42,8 @@ pub enum Action {
         /// Follow symlinks during resolution (default true). When false,
         /// paths resolving through a symlink are refused.
         follow_symlinks: bool,
-        /// Opt-out of module source-leak protection.
-        serve_sources: bool,
-        /// Per-app `execute` extensions of the fallback application
-        /// (lowercase, no dot): forbidden for this share specifically.
-        extra_source_exts: Vec<String>,
+        /// Opt-out of module source-leak protection (none / all / a list).
+        serve_sources: ServeSources,
         fallback: Option<Box<Action>>,
     },
     Return { status: u16, location: Option<String> },
@@ -58,8 +57,7 @@ pub enum Decision<'r> {
         index: &'r str,
         types: Option<&'r PatternSet>,
         follow_symlinks: bool,
-        serve_sources: bool,
-        extra_source_exts: &'r [String],
+        serve_sources: &'r ServeSources,
         fallback: Option<&'r Action>,
     },
     Return { status: u16, location: Option<&'r str> },
@@ -108,7 +106,7 @@ pub fn compile(validated: &Validated) -> anyhow::Result<CompiledRoutes> {
                     .map(Template::compile)
                     .transpose()?,
                 response_headers,
-                action: compile_action(&step.action, &validated.applications)?,
+                action: compile_action(&step.action)?,
             });
         }
         routes.insert(name.clone(), compiled);
@@ -152,10 +150,7 @@ fn compile_match(m: &Match) -> anyhow::Result<Matcher> {
     })
 }
 
-fn compile_action(
-    action: &ConfAction,
-    apps: &BTreeMap<String, Application>,
-) -> anyhow::Result<Action> {
+fn compile_action(action: &ConfAction) -> anyhow::Result<Action> {
     if let Some(app) = &action.application {
         let ApplicationRef::Name(name) = app else {
             unreachable!("inline apps are extracted during validation");
@@ -167,7 +162,9 @@ fn compile_action(
     }
     if let Some(share) = &action.share {
         let (template, index, types, follow_symlinks, serve_sources) = match share {
-            Share::Path(p) => (p.clone(), "index.html".to_string(), None, true, false),
+            Share::Path(p) => {
+                (p.clone(), "index.html".to_string(), None, true, ServeSources::None)
+            }
             Share::Full(opts) => (
                 opts.share.iter().next().cloned().unwrap_or_default(),
                 opts.index.clone().unwrap_or_else(|| "index.html".to_string()),
@@ -176,35 +173,23 @@ fn compile_action(
                     .map(|t| PatternSet::compile(t.iter().map(String::as_str), true))
                     .transpose()?,
                 opts.follow_symlinks.unwrap_or(true),
-                opts.serve_sources,
+                opts.serve_sources.clone(),
             ),
         };
         let fallback = action
             .fallback
             .as_ref()
-            .map(|f| compile_action(f, apps).map(Box::new))
+            .map(|f| compile_action(f).map(Box::new))
             .transpose()?;
-        // The fallback application shares this file tree: its `execute`
-        // extensions must not be served as static from here.
-        let extra_source_exts = match fallback.as_deref() {
-            Some(Action::Application { name }) => apps
-                .get(name)
-                .map(|a| {
-                    a.execute
-                        .iter()
-                        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+        // Note: an application's `execute` extensions are source-leak-protected
+        // globally (folded into `AppState.source_exts` at startup, like the
+        // module's own extensions), so a share needs no per-fallback list here.
         return Ok(Action::Share {
             template,
             index,
             types,
             follow_symlinks,
             serve_sources,
-            extra_source_exts,
             fallback,
         });
     }
@@ -269,15 +254,13 @@ impl CompiledRoutes {
                     types,
                     follow_symlinks,
                     serve_sources,
-                    extra_source_exts,
                     fallback,
                 } => Decision::Share {
                     template,
                     index,
                     types: types.as_ref(),
                     follow_symlinks: *follow_symlinks,
-                    serve_sources: *serve_sources,
-                    extra_source_exts,
+                    serve_sources,
                     fallback: fallback.as_deref(),
                 },
                 Action::Return { status, location } => {

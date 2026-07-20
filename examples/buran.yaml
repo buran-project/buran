@@ -1,45 +1,100 @@
-# Example Buran configuration for local development.
-# Run: cargo run -p buran -- --config examples/buran.yaml
+# Buran configuration — annotated reference for local development.
+#
+# Runnable as-is:  cargo run -p buran -- --config examples/buran.yaml
+# Validate:        buran --check-config --config examples/buran.yaml
+#
+# Every supported key is shown. Keys with their default value are marked
+# "# default" — omitting them changes nothing. Keys that need root (user/group)
+# or are alternatives to what is active are left commented out. Dev paths are
+# used so it runs from a checkout; production equivalents are noted inline.
+#
+# Full prose: docs/configuration.md, docs/routing.md, docs/applications.md.
 
+# ─── settings — server-wide knobs; the whole block is optional. ──────────────
 settings:
-  modules: ./target/debug          # buran-php lives here during development
+  # listen_threads: 4                # tokio worker threads; default: host CPU count
+  modules: ./target/debug            # runtime module dir (prod: /usr/lib/buran/modules)
   http:
-    max_body_size: 8388608
+    header_read_timeout: 30          # default; wall-clock budget for the WHOLE header block (s)
+    body_read_timeout: 30            # default; max silence between body reads (s)
+    send_timeout: 30                 # default; time allowed to write the response (s)
+    idle_timeout: 180                # default; keep-alive idle between requests (s)
+    max_body_size: 8388608           # default 8 MiB; larger bodies get 413 (bytes)
+    min_body_rate: 256               # default; min sustained body throughput after grace (bytes/s); 0 disables (slow-POST/RUDY)
+    max_connections: 4096            # default; process-wide connection cap; counts WS tunnels; 0 disables
+    body_temp_path: /var/tmp/buran   # default; spill dir for bodies too large for memory
+    server_version: true             # default; false = bare `buran` in the Server header
     static:
-      mime_types:
+      mime_types:                    # extra MIME -> [extensions], ADDED to the built-in table
         text/x-buran: [".brn"]
+    websocket:
+      idle_timeout: 600              # default; two-way silence before a tunnel closes 1001 (s)
+      max_message_size: 1048576      # default 1 MiB; larger client messages close 1009 (bytes)
 
+# ─── access_log — combined format; omit to disable. Query + Referer/UA are
+#     logged verbatim (CR/LF-escaped), so keep secrets out of URLs. ───────────
+access_log: /tmp/buran-access.log
+
+# ─── error_log — diagnostic log (server + worker stdout/stderr). Omit -> stderr
+#     (container-native default). Level via RUST_LOG. Non-blocking writer.
+#     Rotate with copytruncate (Buran holds the file open). Fatal startup errors
+#     always go to stderr regardless — if the server won't start, look there. ──
+# error_log: /var/log/buran/error.log
+
+# ─── listeners — bind "host:port" -> a route XOR the status endpoint. `*` binds
+#     all interfaces; IPv6 as "[::1]:8080"; ports < 1024 need root. ───────────
 listeners:
   "127.0.0.1:8180":
     route: main
   "127.0.0.1:9190":
-    status: true
+    status: true                     # GET /health -> ok; GET /health/applications -> pool metrics; else 404
+                                     # No in-config ACL — bind it to a trusted interface only.
 
+# ─── routes — ordered `match -> action` steps; first match wins. A step with no
+#     `match` matches everything (final fallthrough).
+#     Patterns: `*` wildcard, `!` negation, `~` regex prefix.
+#     Template vars: $uri $args ($query) $host $method $remote_addr ───────────
 routes:
   main:
-    # static assets go straight from disk
+    # Refuse sensitive files before any `share` can serve them. Buran only
+    # auto-blocks executable sources (.php ...); what else is sensitive is
+    # deployment-specific and yours to deny. Tune the list. 404 (not 403) so a
+    # probe cannot confirm a file exists. See docs/static-files.md.
+    - match:
+        uri: "~/\\.(git|env|ht[a-z]*)(/|$)"
+      action:
+        return: 404
+
+    # static assets straight from disk (share, short form)
     - match:
         uri: ["/assets/*", "*.ico"]
       action:
         share: ./examples/public$uri
 
+    # return + redirect
     - match:
         uri: "/old"
       action:
         return: 301
         location: /
 
-    # rewrite demo: pretty URLs -> front controller with the page argument
+    # rewrite demo + response header rewriting; full match block shown
     - match:
         uri: "/page/*"
+        method: [GET, POST]
+        # host: ["example.com", "*.example.com"]
+        # query: "debug=1"
+        # arguments: { page: "*" }
+        # headers: { x-token: "secret" }
+        source: ["127.0.0.0/8", "::1"]
       action:
-        rewrite: /index.php?page=$uri
+        rewrite: /index.php?page=$uri        # rewrites path+query; REQUEST_URI keeps the original
         application: site
         response_headers:
           x-rewritten: "1"
-          x-powered-by: null   # strip whatever PHP sets
+          x-powered-by: null                 # null strips a header the app set
 
-    # full match demo: local debug endpoint, GET only, with a header guard
+    # header-guarded local debug endpoint, GET only
     - match:
         uri: "/debug"
         method: GET
@@ -49,31 +104,65 @@ routes:
       action:
         return: 204
 
-    # try static files first, everything else goes to PHP. No `!*.php`
-    # needed: the php module declares .php/.phtml/.phar as sources and the
-    # router refuses to serve them as static files by design.
+    # WebSocket origin gate: WS bypasses CORS but still carries cookies, so an
+    # authenticated /ws endpoint must allowlist Origin or it is hijackable
+    # (CSWSH). Browsers always send Origin and JS can't forge it. See
+    # docs/configuration.md. (Commented: no /ws backend in this demo.)
+    # - match:
+    #     uri: "/ws"
+    #     headers: { origin: "https://app.example.com" }
+    #   action: { application: site }
+    # - match: { uri: "/ws" }        # any other origin (or none) -> refuse
+    #   action: { return: 403 }
+
+    # internal jump to another route
+    # - match: { uri: "/legacy/*" }
+    #   action: { route: legacy }
+
+    # try static first, everything else -> PHP (share full form + fallback).
+    # No `!*.php` needed: the module declares .php/.phtml/.phar as sources and
+    # the router refuses to serve them as static by design.
     - action:
-        share: ./examples/public$uri
-        fallback:
+        share:
+          share: ./examples/public$uri       # path, or a list of candidate roots
+          index: index.html                  # default; file served for a directory
+          # types: ["text/*"]                # only serve these MIME types; others fall through
+          follow_symlinks: false             # default; true follows symlinks within the root
+          serve_sources: false               # default; true = all sources raw, or [".php"] = only those (least-privilege)
+        fallback:                            # taken when `share` misses (40x)
           application: site
 
+  # legacy:
+  #   - action: { return: 410 }
+
+# ─── applications — a runtime module bound to a document root + worker pool.
+#     Only `module` is required. ────────────────────────────────────────────
 applications:
   site:
-    module: php
-    root: ./examples/public
-    index: index.php
-    processes: { max: 8, spare: 1, idle_timeout: 2 }
-    # concurrency: 64   # cap per worker; only matters for event-loop
-    #                   # runtimes (blocking modules always run at 1)
+    module: php                        # binary suffix -> <modules>/buran-php (prod e.g. php85)
+    root: ./examples/public            # document root
+    index: index.php                   # directory index file
+    # script: index.php                # single front-controller (alternative to root+index)
+    # user: www-data                   # drop worker uid (requires a root master)
+    # group: www-data                  # drop worker gid (requires a root master)
+    # working_directory: ./examples/public
+    # execute: [".html"]               # extra executable extensions (also excluded from static serving)
+    environment:                       # env for workers (passed via environ, not argv)
+      APP_ENV: development
+    processes: { max: 8, spare: 1, idle_timeout: 2 }   # or `auto` (default: 1/CPU), or a fixed N
+    # concurrency: 64                  # per-worker in-flight cap; PHP (blocking) is always 1
+    queue:
+      max: 24000                       # default; parked-request cap (memory guard); over -> 503
+      timeout: 15                      # default; seconds a request may wait before an instant 503
     limits:
-      timeout: 30
-      requests: 5        # tiny value to demo worker recycling
-    options:
-      admin:
+      response_timeout: 60             # default; wait for worker output -> 504 + Abort (worker NOT killed)
+      task_timeout: 300                # default; total per-task incl. background -> Abort, kill if defiant
+      requests: 5                      # default 0 (never); tiny value here to demo worker recycling
+    options:                           # module-specific (PHP shown); validated by the module
+      # ini_file: /etc/buran/php.ini   # optional extra php.ini to load
+      admin:                           # system ini, not overridable by ini_set() (like php_admin_value)
         opcache.enable: "1"
         opcache.memory_consumption: 192
         memory_limit: 256M
-      user:
+      user:                            # ini defaults scripts may override via ini_set()
         display_errors: "0"
-
-access_log: /tmp/buran-access.log

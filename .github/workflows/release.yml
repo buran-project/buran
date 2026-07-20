@@ -193,46 +193,33 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # A release can ship without a crate version bump (e.g. re-cutting images
-      # after a distro CVE patch). Then the crate version simply lags the tag
-      # and there's nothing new to publish — so skip the publish step instead
-      # of failing the job. crates.io is immutable anyway: republishing an
-      # existing version would error out regardless.
-      - name: Check crate version matches tag
-        id: crate_version
-        run: |
-          set -eu
-          v="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name=="buran-ipc") | .version')"
-          if [ "$v" = "$VERSION" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo ">> crate version $v does not match tag $VERSION — skipping crates.io publish"
-          fi
-
-      - name: Publish to crates.io
-        if: steps.crate_version.outputs.publish == 'true'
+      # The published SDK crates (buran-ipc, buran-worker) version independently
+      # of the release tag — they bump only when their own API changes, not on
+      # every image/package release (which move the server version). So publish
+      # each crate on its OWN manifest version, and only when that version is not
+      # already on crates.io: a server-only release (crates unchanged) publishes
+      # nothing, and a re-run never re-uploads an existing version — which
+      # crates.io forbids — so the job stays idempotent.
+      - name: Publish new SDK crate versions to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -eu
-          # Idempotent by design: re-running the workflow for the same release
-          # (republishing images after a distro CVE patch, or retrying a
-          # half-failed run) must not try to re-upload a version that already
-          # exists — crates.io forbids that. Skip crates already on the registry
-          # and only publish genuinely new ones. Order stays leaf-first; cargo
-          # (>=1.66) blocks until each crate is indexed before the next.
           ua="buran-release (+https://github.com/buran-project/buran)"
-          published() {
+          published() {  # $1=crate $2=version
             code="$(curl -s -o /dev/null -w '%{http_code}' -A "$ua" \
-              "https://crates.io/api/v1/crates/$1/$VERSION")"
+              "https://crates.io/api/v1/crates/$1/$2")"
             [ "$code" = "200" ]
           }
+          # Leaf-first order; cargo (>=1.66) blocks until each crate is indexed
+          # before the next, so buran-worker sees a freshly published buran-ipc.
           for crate in buran-ipc buran-worker; do
-            if published "$crate"; then
-              echo ">> $crate $VERSION already on crates.io — skipping"
+            v="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')"
+            if published "$crate" "$v"; then
+              echo ">> $crate $v already on crates.io — skipping"
             else
+              echo ">> publishing $crate $v"
               cargo publish --locked -p "$crate"
             fi
           done

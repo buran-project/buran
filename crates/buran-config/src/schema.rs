@@ -40,6 +40,9 @@ pub struct Config {
     pub routes: BTreeMap<String, Vec<RouteStep>>,
     pub applications: BTreeMap<String, Application>,
     pub access_log: Option<String>,
+    /// Diagnostic/error log destination (server + worker stdout/stderr). A file
+    /// path; omit to write to stderr. Level is controlled by `RUST_LOG`.
+    pub error_log: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +73,15 @@ pub struct HttpSettings {
     pub send_timeout: u64,
     pub idle_timeout: u64,
     pub max_body_size: u64,
+    /// Bytes/second. Sustained minimum request-body throughput after an
+    /// initial grace window (body_read_timeout): a client sending the body
+    /// slower than this is cut (slow-POST / RUDY defence). `0` disables it.
+    pub min_body_rate: u64,
+    /// Process-wide cap on concurrent connections (across all listeners). At
+    /// the cap the server stops accepting, so surplus connections wait in the
+    /// kernel backlog and consume no local fd. Counts long-lived tunnels
+    /// (WebSocket) too — size it above expected concurrency. `0` disables it.
+    pub max_connections: u64,
     pub body_temp_path: String,
     #[serde(rename = "static")]
     pub static_: Option<StaticSettings>,
@@ -85,6 +97,8 @@ impl Default for HttpSettings {
             send_timeout: 30,
             idle_timeout: 180,
             max_body_size: 8 * 1024 * 1024,
+            min_body_rate: 256,
+            max_connections: 4096,
             body_temp_path: "/var/tmp/buran".to_string(),
             static_: None,
             server_version: true,
@@ -184,6 +198,62 @@ pub enum Share {
     Full(ShareOptions),
 }
 
+/// `serve_sources`: opt out of source-leak protection. `false`/absent keeps
+/// protection on; `true` serves every source extension raw; a list serves only
+/// the named extensions raw (least privilege), e.g. `[".php"]`.
+#[derive(Debug, Clone, Default)]
+pub enum ServeSources {
+    #[default]
+    None,
+    All,
+    Only(Vec<String>),
+}
+
+impl ServeSources {
+    /// Whether this actually opts out of protection for anything. An empty
+    /// `Only([])` list opts nothing in, so it behaves like `None` (protection
+    /// stays on) rather than tripping the app-fallback rejection for a no-op.
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            ServeSources::None => false,
+            ServeSources::All => true,
+            ServeSources::Only(exts) => !exts.is_empty(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ServeSources {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ServeSources;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a boolean or a list of source extensions to serve")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<ServeSources, E> {
+                Ok(if v { ServeSources::All } else { ServeSources::None })
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<ServeSources, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut exts = Vec::new();
+                while let Some(e) = seq.next_element::<String>()? {
+                    exts.push(e);
+                }
+                Ok(ServeSources::Only(exts))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareOptions {
@@ -196,9 +266,9 @@ pub struct ShareOptions {
     pub follow_symlinks: Option<bool>,
     /// Opt-out of source-leak protection: serve files with extensions the
     /// runtime modules declared as executable sources (.php, ...). Off by
-    /// default on purpose.
+    /// default on purpose. `true` = all sources; `[".php", ...]` = only those.
     #[serde(default)]
-    pub serve_sources: bool,
+    pub serve_sources: ServeSources,
 }
 
 #[derive(Debug, Clone, Deserialize)]

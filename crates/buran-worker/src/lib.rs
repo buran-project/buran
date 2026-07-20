@@ -242,7 +242,6 @@ pub fn run<F>(
     work: UnixDatagram,
     resp: UnixStream,
     max_requests: u64,
-    token: u64,
     mut handler: F,
 ) -> Result<(), WorkerError>
 where
@@ -265,7 +264,6 @@ where
         pid: std::process::id(),
         concurrency: 1,
         capabilities: 0,
-        token,
     }
     .encode();
     let mut msg = Vec::with_capacity(FRAME_HEADER_LEN + hello.len());
@@ -402,6 +400,15 @@ fn read_hello_ack(stream: &mut UnixStream) -> Result<HelloAck, WorkerError> {
     }
     // Grow with the data; a bogus payload_len hits EOF rather than pre-allocating.
     let want = u64::from(header.payload_len);
+    // A HelloAck is a handful of bytes; reject an absurd length up front so a
+    // misbehaving router cannot make the worker buffer up to ~4 GiB.
+    const MAX_HELLO_ACK: u64 = 4096;
+    if want > MAX_HELLO_ACK {
+        return Err(std::io::Error::other(format!(
+            "handshake: HelloAck payload {want} exceeds {MAX_HELLO_ACK}"
+        ))
+        .into());
+    }
     let mut payload = Vec::new();
     if (&mut *stream).take(want).read_to_end(&mut payload)? as u64 != want {
         return Err(WorkerError::Closed);
@@ -635,7 +642,7 @@ mod tests {
         });
 
         // max_requests = 1: the loop must return cleanly after one response.
-        run(work_worker, stream_worker, 1, 0, |view, flags, responder| {
+        run(work_worker, stream_worker, 1, |view, flags, responder| {
             assert_eq!(flags, 0);
             responder.send_headers(200, b"x-test: 1\r\n")?;
             let mut line = view.method().unwrap().to_vec();
@@ -665,7 +672,7 @@ mod tests {
             (work_router, stream_router) // keep both alive until the worker exits
         });
 
-        run(work_worker, stream_worker, 0, 0, |_, _, _| panic!("no request was sent")).unwrap();
+        run(work_worker, stream_worker, 0, |_, _, _| panic!("no request was sent")).unwrap();
         router.join().unwrap();
     }
 
@@ -691,7 +698,7 @@ mod tests {
             (work_router, stream_router)
         });
 
-        run(work_worker, stream_worker, 0, 0, |_, _, _| panic!("no request was sent")).unwrap();
+        run(work_worker, stream_worker, 0, |_, _, _| panic!("no request was sent")).unwrap();
         router.join().unwrap();
     }
 }

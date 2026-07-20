@@ -94,11 +94,33 @@ fn responder<'a>(ctx: &mut RequestCtx) -> &'a mut Responder<'static> {
 /// the only stage where zend_extensions (opcache) can be loaded. The
 /// admin/user distinction (PHP_INI_SYSTEM vs ini_set-able) is phase 2.
 pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
-    let ini = app.ini_file.as_deref().map(|p| CString::new(p).unwrap());
-    let ini_ptr = ini.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    // The engine stores this pointer in the process-global SAPI module
+    // (`php_ini_path_override`) and reads it during startup — and potentially
+    // again later — so it must live for the whole process. Leak the CString
+    // deliberately, exactly like `entries_ptr` below: a local would leave a
+    // dangling pointer in the SAPI struct the moment boot() returns.
+    let ini_ptr = match app.ini_file.as_deref() {
+        None => std::ptr::null(),
+        Some(p) => {
+            let c = CString::new(p)
+                .map_err(|_| std::io::Error::other("ini_file path contains a NUL byte"))?;
+            let ptr = c.as_ptr();
+            std::mem::forget(c);
+            ptr
+        }
+    };
 
     let mut entries = String::new();
     for (name, value) in app.admin.iter().chain(app.user.iter()) {
+        // A newline in a name/value would smuggle an extra ini directive (e.g.
+        // an ${ENV}-substituted value carrying "\nauto_prepend_file=..."). Real
+        // ini directives never contain CR/LF, so reject rather than inject.
+        if name.contains(['\n', '\r']) || value.contains(['\n', '\r']) {
+            return Err(std::io::Error::other(format!(
+                "ini directive \"{name}\" contains a newline"
+            ))
+            .into());
+        }
         entries.push_str(name);
         entries.push('=');
         entries.push_str(value);
@@ -126,22 +148,17 @@ pub fn boot(app: &AppConfig) -> Result<(), WorkerError> {
 /// Serve requests on an already-booted engine. Forked workers land here;
 /// they exit without engine shutdown (FPM practice — the request boundary
 /// is `php_request_startup/shutdown`, the process just dies).
-pub fn serve(
-    work: &UnixDatagram,
-    stream: UnixStream,
-    app: &AppConfig,
-    token: u64,
-) -> Result<(), WorkerError> {
+pub fn serve(work: &UnixDatagram, stream: UnixStream, app: &AppConfig) -> Result<(), WorkerError> {
     let work = work.try_clone()?;
-    buran_worker::run(work, stream, app.max_requests, token, |req, flags, resp| {
+    buran_worker::run(work, stream, app.max_requests, |req, flags, resp| {
         handle(req, flags, resp, app)
     })
 }
 
-/// Entry point for standalone `--channel` mode (no prototype, so no token).
+/// Entry point for standalone `--channel` mode (no prototype).
 pub fn run(work: &UnixDatagram, stream: UnixStream, app: AppConfig) -> Result<(), WorkerError> {
     boot(&app)?;
-    let result = serve(work, stream, &app, 0);
+    let result = serve(work, stream, &app);
     unsafe { ffi::bphp_sapi_shutdown() };
     result
 }
@@ -159,7 +176,14 @@ fn handle(
     // never opens the file, so pre-opening would waste an fd per request.
     let script = match resolve_script(app, path).and_then(|s| {
         match std::fs::metadata(&s.filename) {
-            Ok(m) if m.is_file() => Ok(s),
+            // Confine to the document root: a symlink inside root pointing
+            // outside must not be executed. The static layer is openat2-
+            // contained; the PHP path gets the same guarantee via a canonical
+            // under-root check (in-root symlinks — deploy `current/` — still
+            // work). SCRIPT_FILENAME keeps the original path for the app.
+            Ok(m) if m.is_file() => {
+                if under_root(&s.filename, &app.root) { Ok(s) } else { Err(404) }
+            }
             Ok(_) => Err(403),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(403),
             Err(_) => Err(404),
@@ -249,6 +273,14 @@ fn handle(
 
     CTX.with(|slot| *slot.borrow_mut() = Some(ctx));
 
+    // Clamp before the u64 -> c_long (i64) cast: a Content-Length above
+    // i64::MAX would wrap to a negative value in SG(request_info).content_length,
+    // which libphp treats as a signed size (a signed/unsigned confusion we do
+    // not control). The router caps it at max_body_size on the normal path;
+    // this guards the standalone/untrusted-peer paths too. Our own body reads
+    // stay bounded by the Rust buffer regardless.
+    let content_length = req.content_length().min(c_long::MAX as u64) as c_long;
+
     // Safety: all CStrings above outlive the call; ctx is set.
     let status = unsafe {
         ffi::bphp_sapi_request(
@@ -257,7 +289,7 @@ fn handle(
             uri.as_ptr(),
             query_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             content_type.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            req.content_length() as c_long,
+            content_length,
             auth.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
         )
     };
@@ -300,6 +332,18 @@ const INTRINSIC_EXTS: [&str; 2] = [".php", ".phtml"];
 
 /// CGI-like script resolution per spec section 2.5 (matches what frameworks
 /// expect from php-fpm).
+/// Is `filename`, with all symlinks resolved, inside `root`? Follows symlinks
+/// (an in-root `current/` deploy link still works) but rejects any that escape
+/// the document root. TOCTOU-tolerant: a later open may still race, but a
+/// symlink pointing outside is refused here rather than executed.
+fn under_root(filename: &str, root: &str) -> bool {
+    match (std::fs::canonicalize(filename), std::fs::canonicalize(root)) {
+        (Ok(real), Ok(real_root)) => real.starts_with(&real_root),
+        // Unresolvable path or root: refuse.
+        _ => false,
+    }
+}
+
 fn resolve_script(app: &AppConfig, path: &[u8]) -> Result<ResolvedScript, u16> {
     let path = std::str::from_utf8(path).map_err(|_| 400u16)?;
 
@@ -637,6 +681,27 @@ mod tests {
             script_name: "/index.php".to_string(),
             path_info: None,
         }
+    }
+
+    #[test]
+    fn under_root_confines_symlinks_to_the_document_root() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("buran-under-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("app.php"), b"<?php").unwrap();
+        // A symlink inside root that points outside it.
+        symlink(std::env::temp_dir(), root.join("escape")).unwrap();
+
+        let root_s = root.to_str().unwrap();
+        // A real file inside root is accepted.
+        assert!(under_root(root.join("app.php").to_str().unwrap(), root_s));
+        // Following the escaping symlink lands outside root -> refused.
+        assert!(!under_root(root.join("escape").to_str().unwrap(), root_s));
+        // An absolute path outside root -> refused.
+        assert!(!under_root("/etc", root_s));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

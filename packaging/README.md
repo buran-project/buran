@@ -17,8 +17,8 @@ platforms/alpine/APKBUILD     subpackages buran-php83/84/85 (parallel PHP branch
 platforms/alpine/buran.initd  OpenRC service
 platforms/debian/             debhelper packaging; module for the release's PHP
 platforms/rpm/buran.spec      Fedora-style spec; module for the release's PHP
-common/systemd/               buran.service, sysusers.d, tmpfiles.d — single source
-                              of truth, staged by the debian/rpm recipes at build
+common/systemd/               buran.service, sysusers.d — single source of
+                              truth, staged by the debian/rpm recipes at build
 common/buran/buran.yaml       default config shipped by all packages
 ```
 

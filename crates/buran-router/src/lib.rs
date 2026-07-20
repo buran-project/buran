@@ -33,8 +33,11 @@ pub struct AppState {
     pub access_log: Option<access_log::AccessLog>,
     /// settings.http.static.mime_types inverted: extension -> mime.
     pub mime_overrides: BTreeMap<String, String>,
-    /// Union of module source extensions (lowercase, no dot): never served
-    /// as static files unless a share opts in with `serve_sources: true`.
+    /// Extensions never served as static files unless a share opts in with
+    /// `serve_sources` (lowercase, no dot): the union of every module's declared
+    /// source extensions and every application's `execute` list. Global by
+    /// design — like the module extensions, an executable source is protected on
+    /// every share regardless of how a request reaches it (fallback or route).
     pub source_exts: std::collections::BTreeSet<String>,
 }
 
@@ -55,8 +58,18 @@ impl Router {
     pub fn new(
         validated: &Validated,
         mut spawners: BTreeMap<String, (Spawner, std::os::unix::net::UnixDatagram, Option<u32>)>,
-        source_exts: std::collections::BTreeSet<String>,
+        mut source_exts: std::collections::BTreeSet<String>,
     ) -> anyhow::Result<Self> {
+        // An application's `execute` extensions are executable source too (docs:
+        // "also excluded from static serving"), so fold them into the same
+        // global set the module's intrinsic extensions use. This protects every
+        // share regardless of how a request reaches it — direct fallback or a
+        // route jump — exactly like the module extensions already do.
+        for app in validated.applications.values() {
+            for ext in &app.execute {
+                source_exts.insert(ext.trim_start_matches('.').to_ascii_lowercase());
+            }
+        }
         let routes = routes::compile(validated)?;
 
         let body_temp = validated.config.settings.http.body_temp_path.clone();
@@ -122,9 +135,12 @@ impl Router {
         self,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        let max_conn = self.state.http.max_connections;
         let tracker = Arc::new(ConnTracker {
             count: std::sync::atomic::AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
+            limit: (max_conn > 0)
+                .then(|| Arc::new(tokio::sync::Semaphore::new(max_conn as usize))),
         });
         let mut joins = Vec::new();
 
@@ -158,10 +174,14 @@ impl Router {
     }
 }
 
-/// Live connection accounting for graceful drain.
+/// Live connection accounting for graceful drain and the process-wide
+/// concurrency cap (`settings.http.max_connections`).
 struct ConnTracker {
     count: std::sync::atomic::AtomicUsize,
     drained: tokio::sync::Notify,
+    /// `None` when the cap is disabled (`max_connections: 0`). Otherwise a
+    /// permit is taken before each accept and held for the connection's life.
+    limit: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 async fn accept_loop(
@@ -196,12 +216,31 @@ async fn accept_loop(
                 continue;
             }
         };
+
+        // Reserve a connection slot AFTER accepting, so a permit is only ever
+        // held by a listener that actually has a connection: an idle listener
+        // never parks a permit inside accept() and cannot starve a busy one
+        // sharing the cap. At the cap the loop blocks here (having accepted one
+        // connection); the rest wait in the kernel backlog. The permit rides
+        // into the connection task and frees the slot when it finishes.
+        let permit = match &tracker.limit {
+            Some(sem) => tokio::select! {
+                p = Arc::clone(sem).acquire_owned() => match p {
+                    Ok(p) => Some(p),
+                    Err(_) => return Ok(()), // semaphore closed
+                },
+                _ = shutdown.changed() => return Ok(()), // drop the accepted stream
+            },
+            None => None,
+        };
         let kind = kind.clone();
         let state = Arc::clone(&state);
         let tracker = Arc::clone(&tracker);
         tracker.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
+            // Held for the whole connection; dropping it frees a cap slot.
+            let _permit = permit;
             if let Err(e) = http1::serve_connection(stream, peer, kind, state, conn_shutdown).await {
                 tracing::debug!(%peer, error = %e, "connection closed with error");
             }

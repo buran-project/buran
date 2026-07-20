@@ -1,9 +1,10 @@
 //! Static file serving with kernel-level containment.
 //!
-//! For the common `share: /base$uri` template the file is opened via
-//! openat2(RESOLVE_IN_ROOT): symlink/`..` escapes are impossible by
-//! construction (spec 2.6). Templates where `$uri` is not the suffix fall
-//! back to string substitution guarded by the normalized path.
+//! The template is split at `$uri` into a literal directory prefix (the share
+//! root) and the rest; the file is opened via openat2(RESOLVE_IN_ROOT) confined
+//! to that prefix, so symlink/`..` escapes are impossible by construction (spec
+//! 2.6) for every template shape — including non-suffix ones like
+//! `/srv/data$uri.bak`, which jail to `/srv/data`, not the whole filesystem.
 //!
 //! Conditional requests: strong ETag (size+mtime) with If-None-Match, and
 //! Last-Modified with exact-match If-Modified-Since (the header we sent,
@@ -13,6 +14,7 @@
 
 use std::collections::BTreeMap;
 
+use buran_config::ServeSources;
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -24,14 +26,14 @@ const COPY_CHUNK: usize = 64 * 1024;
 pub struct StaticContext<'a> {
     pub types: Option<&'a PatternSet>,
     pub mime_overrides: &'a BTreeMap<String, String>,
-    /// Module source extensions: refused unless `serve_sources` opts in.
+    /// Source extensions never served as static unless `serve_sources` opts in
+    /// (all, or the specific extension). Union of every module's declared
+    /// extensions and every application's `execute` list, built once at startup.
     pub source_exts: &'a std::collections::BTreeSet<String>,
-    /// Per-share extras (fallback application's `execute` list).
-    pub extra_source_exts: &'a [String],
     /// Follow symlinks during resolution; when false, openat2 refuses any
     /// path component that is a symlink.
     pub follow_symlinks: bool,
-    pub serve_sources: bool,
+    pub serve_sources: &'a ServeSources,
     pub req_headers: &'a [(Vec<u8>, Vec<u8>)],
     pub head_only: bool,
     pub extra_headers: &'a [(&'a str, Option<&'a str>)],
@@ -50,10 +52,18 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
 ) -> anyhow::Result<Option<u16>> {
     let uri = String::from_utf8_lossy(path);
 
-    // Relative target within the share root.
-    let (base, mut target) = match template.strip_suffix("$uri") {
-        Some(base) => (base.to_string(), uri.to_string()),
-        None => (String::from("/"), template.replace("$uri", &uri)),
+    // Split the template at `$uri` into a literal directory prefix (the share
+    // root) and the rest. openat2(IN_ROOT) then confines resolution to that
+    // prefix for EVERY template shape, not just `/base$uri`: a non-suffix
+    // template like `/srv/data$uri.bak` still jails to `/srv/data` instead of
+    // the whole filesystem. `$uri` is normalized (no `..`), so the request can
+    // only append path segments within the prefix.
+    let (base, mut target) = match template.split_once("$uri") {
+        Some((prefix, suffix)) => {
+            (prefix.to_string(), format!("{uri}{}", suffix.replace("$uri", &uri)))
+        }
+        // No `$uri`: a fixed path served from the filesystem root.
+        None => (String::from("/"), template.to_string()),
     };
 
     if target.ends_with('/') {
@@ -61,11 +71,28 @@ pub async fn serve<W: AsyncWriteExt + Unpin>(
     }
 
     // Source-leak protection: extensions the runtime modules declared as
-    // executable sources are never static, no matter what the share says
-    // (explicit `serve_sources: true` excepted). Case-insensitive.
-    if !ctx.serve_sources {
-        let ext = target.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-        if ctx.source_exts.contains(&ext) || ctx.extra_source_exts.iter().any(|e| e == &ext) {
+    // executable sources are never static, no matter what the share says,
+    // unless `serve_sources` opts that extension in (all, or a named list).
+    // Case-insensitive.
+    // Trim trailing dots/spaces before extracting the extension: on a
+    // case-/dot-insensitive mount `app.php.` opens `app.php`, so the ext check
+    // must see `php`, not the empty string a naive rsplit('.') would yield.
+    let ext = target
+        .trim_end_matches(['.', ' '])
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_source = ctx.source_exts.contains(&ext);
+    if is_source {
+        let opted_in = match ctx.serve_sources {
+            ServeSources::None => false,
+            ServeSources::All => true,
+            ServeSources::Only(exts) => {
+                exts.iter().any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext))
+            }
+        };
+        if !opted_in {
             return Ok(None);
         }
     }
@@ -384,14 +411,13 @@ mod tests {
         mime_overrides: &'a BTreeMap<String, String>,
         source_exts: &'a BTreeSet<String>,
         req_headers: &'a [(Vec<u8>, Vec<u8>)],
-        serve_sources: bool,
+        serve_sources: &'a ServeSources,
         head_only: bool,
     ) -> StaticContext<'a> {
         StaticContext {
             types: None,
             mime_overrides,
             source_exts,
-            extra_source_exts: &[],
             follow_symlinks: true,
             serve_sources,
             req_headers,
@@ -425,7 +451,7 @@ mod tests {
         let mime = BTreeMap::new();
         let mut out = Vec::new();
         let status =
-            serve(&mut out, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &[], false, false))
+            serve(&mut out, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &[], &ServeSources::None, false))
                 .await
                 .unwrap();
         assert_eq!(status, Some(200));
@@ -436,13 +462,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_suffix_template_serves_within_prefix() {
+        // `$uri` is not the suffix: the share root is the literal prefix and
+        // `/page` resolves to `<dir>/page.html`, jailed to <dir> (not `/`).
+        let dir = TempDir::new();
+        dir.write("page.html", b"<h1>hi</h1>");
+        let src = BTreeSet::new();
+        let mime = BTreeMap::new();
+        let template = format!("{}$uri.html", dir.0.to_str().unwrap());
+        let mut out = Vec::new();
+        let status =
+            serve(&mut out, &template, "index.html", b"/page", &ctx(&mime, &src, &[], &ServeSources::None, false))
+                .await
+                .unwrap();
+        assert_eq!(status, Some(200));
+        assert_eq!(body_of(&out), b"<h1>hi</h1>");
+    }
+
+    #[tokio::test]
     async fn head_request_omits_body() {
         let dir = TempDir::new();
         dir.write("hello.txt", b"hello world");
         let src = BTreeSet::new();
         let mime = BTreeMap::new();
         let mut out = Vec::new();
-        serve(&mut out, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &[], false, true))
+        serve(&mut out, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &[], &ServeSources::None, true))
             .await
             .unwrap();
         assert_eq!(header(&out, "content-length").as_deref(), Some("11"));
@@ -456,7 +500,7 @@ mod tests {
         let mime = BTreeMap::new();
         let mut out = Vec::new();
         let status =
-            serve(&mut out, &dir.template(), "index.html", b"/nope.txt", &ctx(&mime, &src, &[], false, false))
+            serve(&mut out, &dir.template(), "index.html", b"/nope.txt", &ctx(&mime, &src, &[], &ServeSources::None, false))
                 .await
                 .unwrap();
         assert_eq!(status, None);
@@ -473,17 +517,72 @@ mod tests {
         let mut out = Vec::new();
         // Source-leak protection: .php is refused -> fallback.
         let status =
-            serve(&mut out, &dir.template(), "index.html", b"/app.php", &ctx(&mime, &src, &[], false, false))
+            serve(&mut out, &dir.template(), "index.html", b"/app.php", &ctx(&mime, &src, &[], &ServeSources::None, false))
                 .await
                 .unwrap();
         assert_eq!(status, None);
-        // Opt-in serves it.
+        // Opt-in (all) serves it.
         let mut out2 = Vec::new();
         let status2 =
-            serve(&mut out2, &dir.template(), "index.html", b"/app.php", &ctx(&mime, &src, &[], true, false))
+            serve(&mut out2, &dir.template(), "index.html", b"/app.php", &ctx(&mime, &src, &[], &ServeSources::All, false))
                 .await
                 .unwrap();
         assert_eq!(status2, Some(200));
+
+        // Opt-in via a matching extension list also serves it; a
+        // non-matching list keeps protection.
+        let only_php = ServeSources::Only(vec![".php".to_string()]);
+        let mut out3 = Vec::new();
+        let s3 = serve(&mut out3, &dir.template(), "index.html", b"/app.php", &ctx(&mime, &src, &[], &only_php, false))
+            .await
+            .unwrap();
+        assert_eq!(s3, Some(200));
+
+        let only_inc = ServeSources::Only(vec!["inc".to_string()]);
+        let mut out4 = Vec::new();
+        let s4 = serve(&mut out4, &dir.template(), "index.html", b"/app.php", &ctx(&mime, &src, &[], &only_inc, false))
+            .await
+            .unwrap();
+        assert_eq!(s4, None, "a list not containing php keeps .php protected");
+    }
+
+    #[tokio::test]
+    async fn folded_execute_extension_is_protected_like_a_module_source() {
+        // V1: an application's `execute` extension (e.g. ".inc") is folded into
+        // the global source_exts at startup (see Router::new), so it is refused
+        // as static exactly like a module source — on every share, regardless of
+        // how a request reaches it. The serve layer treats every source_exts
+        // member uniformly; this pins that a non-module extension is no different.
+        let dir = TempDir::new();
+        dir.write("config.inc", b"<?php $db_pass = 'secret';");
+        let mut src = BTreeSet::new();
+        src.insert("inc".to_string()); // as Router::new folds app.execute in
+        let mime = BTreeMap::new();
+
+        let mut out = Vec::new();
+        let status = serve(
+            &mut out,
+            &dir.template(),
+            "index.html",
+            b"/config.inc",
+            &ctx(&mime, &src, &[], &ServeSources::None, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, None, "a folded execute ext must not be served as static");
+
+        // The per-share opt-out still applies to it.
+        let mut out2 = Vec::new();
+        let s2 = serve(
+            &mut out2,
+            &dir.template(),
+            "index.html",
+            b"/config.inc",
+            &ctx(&mime, &src, &[], &ServeSources::All, false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s2, Some(200));
     }
 
     #[tokio::test]
@@ -495,7 +594,7 @@ mod tests {
         let req = [(b"range".to_vec(), b"bytes=2-5".to_vec())];
         let mut out = Vec::new();
         let status =
-            serve(&mut out, &dir.template(), "index.html", b"/data.txt", &ctx(&mime, &src, &req, false, false))
+            serve(&mut out, &dir.template(), "index.html", b"/data.txt", &ctx(&mime, &src, &req, &ServeSources::None, false))
                 .await
                 .unwrap();
         assert_eq!(status, Some(206));
@@ -513,7 +612,7 @@ mod tests {
         let req = [(b"range".to_vec(), b"bytes=99-".to_vec())];
         let mut out = Vec::new();
         let status =
-            serve(&mut out, &dir.template(), "index.html", b"/data.txt", &ctx(&mime, &src, &req, false, false))
+            serve(&mut out, &dir.template(), "index.html", b"/data.txt", &ctx(&mime, &src, &req, &ServeSources::None, false))
                 .await
                 .unwrap();
         assert_eq!(status, Some(416));
@@ -529,7 +628,7 @@ mod tests {
 
         // First fetch to learn the ETag.
         let mut out = Vec::new();
-        serve(&mut out, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &[], false, false))
+        serve(&mut out, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &[], &ServeSources::None, false))
             .await
             .unwrap();
         let etag = header(&out, "etag").unwrap();
@@ -538,7 +637,7 @@ mod tests {
         let req = [(b"if-none-match".to_vec(), etag.into_bytes())];
         let mut out2 = Vec::new();
         let status =
-            serve(&mut out2, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &req, false, false))
+            serve(&mut out2, &dir.template(), "index.html", b"/hello.txt", &ctx(&mime, &src, &req, &ServeSources::None, false))
                 .await
                 .unwrap();
         assert_eq!(status, Some(304));
@@ -553,7 +652,7 @@ mod tests {
         let mime = BTreeMap::new();
         let mut out = Vec::new();
         let status =
-            serve(&mut out, &dir.template(), "index.html", b"/sub", &ctx(&mime, &src, &[], false, false))
+            serve(&mut out, &dir.template(), "index.html", b"/sub", &ctx(&mime, &src, &[], &ServeSources::None, false))
                 .await
                 .unwrap();
         assert_eq!(status, Some(301));

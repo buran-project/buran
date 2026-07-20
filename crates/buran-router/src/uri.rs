@@ -128,6 +128,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_surfaces_decoded_control_bytes() {
+        // Load-bearing for the http1 layer's control-byte reject (response-
+        // splitting defence): percent-encoded CR/LF/NUL in the raw target — which
+        // httparse accepts as valid target bytes — decode to real control bytes
+        // here, so the caller must reject them before they reach a header/$_SERVER.
+        let split = normalize_path(b"/foo%0d%0aSet-Cookie:%20x");
+        assert!(split.contains(&b'\r') && split.contains(&b'\n'));
+        assert!(normalize_path(b"/a%00b").contains(&0));
+        // A clean path carries no controls, so the reject never fires on it.
+        assert!(!normalize_path(b"/a/b/c").iter().any(|&b| b < 0x20 || b == 0x7f));
+    }
+
+    #[test]
     fn percent_decode_valid_and_invalid() {
         assert_eq!(percent_decode(b"a%20b"), b"a b");
         assert_eq!(percent_decode(b"%41%42"), b"AB");

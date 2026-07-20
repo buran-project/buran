@@ -3,7 +3,12 @@
 //! One prototype process per application boots the module runtime once
 //! (for PHP: opcache SHM is created there) and forks warm workers on
 //! command. The supervisor talks to the prototype over a control channel:
-//! one byte per spawn, the worker fd attached via SCM_RIGHTS.
+//! the length-prefixed app-config JSON is sent first, then one CMD_SPAWN per
+//! worker — the supervisor-assigned kill token (8 bytes) plus the worker fd
+//! attached via SCM_RIGHTS. The token is authoritative here, not self-reported
+//! by the worker in Hello, so a compromised worker cannot name a sibling's
+//! token and misdirect a kill. The config travels here rather than on argv so
+//! `${ENV}`-substituted ini secrets stay out of `/proc/<pid>/cmdline`.
 
 use std::io::{IoSlice, Write};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
@@ -11,6 +16,7 @@ use std::os::unix::net::{UnixDatagram, UnixStream as StdUnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -147,12 +153,19 @@ struct PrototypeSpawner {
     /// Worker end of the shared work socket. Held here so the queue (and
     /// any datagrams in flight) survives a prototype restart.
     work_worker_end: OwnedFd,
+    /// Monotonic source of worker kill tokens. Authoritative: the supervisor
+    /// assigns each token and hands it to the prototype with CMD_SPAWN, so the
+    /// token binding never depends on a value the worker self-reports.
+    next_token: AtomicU64,
 }
 
 impl PrototypeSpawner {
     /// Ask the prototype to fork a worker; (re)start the prototype if it is
     /// not running or the control channel is dead.
-    fn spawn_worker(&self) -> anyhow::Result<tokio::net::UnixStream> {
+    fn spawn_worker(&self) -> anyhow::Result<(tokio::net::UnixStream, u64)> {
+        // Assigned once; a retry after a dead prototype reuses it (the fresh
+        // prototype starts with an empty token map, so there is no collision).
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.prototype.lock().expect("prototype lock");
 
         for attempt in 0..2 {
@@ -162,11 +175,13 @@ impl PrototypeSpawner {
             let proto = guard.as_mut().expect("just ensured");
 
             let (ours, theirs) = StdUnixStream::pair().context("worker socketpair")?;
-            match send_fd(&proto.control, theirs.as_raw_fd()) {
+            match send_spawn(&proto.control, theirs.as_raw_fd(), token) {
                 Ok(()) => {
                     drop(theirs);
                     ours.set_nonblocking(true).context("set_nonblocking")?;
-                    return tokio::net::UnixStream::from_std(ours).context("tokio UnixStream");
+                    let stream =
+                        tokio::net::UnixStream::from_std(ours).context("tokio UnixStream")?;
+                    return Ok((stream, token));
                 }
                 Err(e) if attempt == 0 => {
                     // Prototype died: kill leftovers and escalate to restart
@@ -193,8 +208,7 @@ impl PrototypeSpawner {
             .arg(CONTROL_FD.to_string())
             .arg("--work")
             .arg(WORK_FD.to_string())
-            .arg("--app-config")
-            .arg(&self.app_config)
+            // The app config is NOT passed on argv (see send_app_config below).
             // The prototype and every forked worker share these pipes:
             // one reader per application routes them into the error log.
             .stdout(std::process::Stdio::piped())
@@ -224,6 +238,14 @@ impl PrototypeSpawner {
             .with_context(|| format!("spawn prototype {}", self.module_binary.display()))?;
         libc_close(theirs_fd);
 
+        // Hand the app config to the prototype over the control socket, not
+        // argv: ini values may carry ${ENV}-substituted secrets and argv is
+        // world-readable via /proc/<pid>/cmdline. The control socket is private
+        // to the supervisor and this prototype.
+        send_app_config(&control, &self.app_config).with_context(|| {
+            format!("sending app config to prototype {}", self.module_binary.display())
+        })?;
+
         if let Some(out) = child.stdout.take() {
             forward_output(self.app_name.clone(), "stdout", out);
         }
@@ -237,7 +259,7 @@ impl PrototypeSpawner {
 }
 
 impl Spawn for PrototypeSpawner {
-    fn spawn(&self) -> anyhow::Result<tokio::net::UnixStream> {
+    fn spawn(&self) -> anyhow::Result<(tokio::net::UnixStream, u64)> {
         self.spawn_worker()
     }
 
@@ -273,9 +295,14 @@ fn forward_output(app: String, channel: &'static str, pipe: impl std::io::Read +
 const CMD_SPAWN: u8 = 1;
 const CMD_KILL: u8 = 2;
 
-/// One spawn command: the CMD_SPAWN byte with the worker fd attached.
-fn send_fd(control: &StdUnixStream, fd: i32) -> std::io::Result<()> {
-    let data = [CMD_SPAWN];
+/// One spawn command: the CMD_SPAWN byte followed by the 8-byte
+/// supervisor-assigned token, with the worker fd attached via SCM_RIGHTS. On a
+/// stream socket the fd rides with the first data byte, so the prototype reads
+/// the byte + fd, then the token that follows.
+fn send_spawn(control: &StdUnixStream, fd: i32, token: u64) -> std::io::Result<()> {
+    let mut data = [0u8; 9];
+    data[0] = CMD_SPAWN;
+    data[1..9].copy_from_slice(&token.to_le_bytes());
     let iov = [IoSlice::new(&data)];
     let fds = [fd];
     let cmsg = [ControlMessage::ScmRights(&fds)];
@@ -290,6 +317,18 @@ fn send_kill(control: &StdUnixStream, token: u64) -> std::io::Result<()> {
     msg[0] = CMD_KILL;
     msg[1..9].copy_from_slice(&token.to_le_bytes());
     (&mut &*control).write_all(&msg)
+}
+
+/// The app config sent once over the control socket before any spawn command:
+/// a u32 little-endian length prefix followed by the JSON. Kept off argv so
+/// `${ENV}`-substituted ini secrets never leak via `/proc/<pid>/cmdline`.
+fn send_app_config(control: &StdUnixStream, json: &str) -> std::io::Result<()> {
+    let bytes = json.as_bytes();
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "app config too large")
+    })?;
+    (&mut &*control).write_all(&len.to_le_bytes())?;
+    (&mut &*control).write_all(bytes)
 }
 
 /// Returns the spawner, the router end of the shared work socket (the
@@ -314,6 +353,7 @@ pub fn make_spawner(
         env: app.environment.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         working_dir: app.working_directory.as_ref().map(PathBuf::from),
         work_worker_end: OwnedFd::from(worker_end),
+        next_token: AtomicU64::new(1),
     });
     Ok((spawner, router_end, worker_uid))
 }

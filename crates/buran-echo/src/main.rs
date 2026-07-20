@@ -7,8 +7,9 @@
 //! Retire. Modes mirror buran-php:
 //!
 //! - `--describe` — module contract, JSON to stdout
-//! - `--prototype --control <fd> --work <fd> --app-config <json>` —
-//!   fork a worker per command
+//! - `--prototype --control <fd> --work <fd>` — fork a worker per command.
+//!   The app config is read from the control socket (length-prefixed JSON),
+//!   not argv, so ini secrets stay out of `/proc/<pid>/cmdline`.
 //! - `--channel <fd> --work <fd> --app-config <json>` —
 //!   standalone BWP worker
 
@@ -58,14 +59,9 @@ fn main() -> ExitCode {
                 eprintln!("buran-echo: --prototype requires --control <fd> and --work <fd>");
                 return ExitCode::FAILURE;
             };
-            let app = match parse_app_config(&args) {
-                Ok(app) => app,
-                Err(e) => {
-                    eprintln!("buran-echo: bad app config: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            prototype::run(fd, work_fd, app)
+            // The app config arrives over the control socket, not argv (keeps
+            // ini secrets out of /proc/<pid>/cmdline) — see prototype::run.
+            prototype::run(fd, work_fd)
         }
         Some("--channel") => {
             let (Some(fd), Some(work_fd)) = (
@@ -86,7 +82,7 @@ fn main() -> ExitCode {
             // contract and owned exclusively by this process.
             let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
             let work = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(work_fd) };
-            match worker::serve(work, stream, &app, 0) {
+            match worker::serve(work, stream, &app) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("buran-echo: {e}");
