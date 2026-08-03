@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "buran"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "buran-config",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "buran-config"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_norway",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "buran-echo"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "buran-ipc",
  "buran-worker",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "buran-php"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "buran-ipc",
  "buran-worker",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "buran-router"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-channel",
