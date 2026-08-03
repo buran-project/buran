@@ -14,7 +14,7 @@ members = [
 # Server version: the buran binary, images and distro packages. The published
 # SDK crates (buran-ipc, buran-worker) set their OWN version in their manifest
 # and are NOT tied to this — they bump only when their API changes.
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/buran-project/buran"
